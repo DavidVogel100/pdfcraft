@@ -21,13 +21,17 @@ pub struct WorldMesh {
     /// Per triangle, its own colour when its face is styled; `None` (the whole list or an entry)
     /// takes [`Self::colour`].
     pub triangle_colours: Option<Vec<Option<[u8; 4]>>>,
+    /// The placement it was made from: an index into [`PrcFile::placements`], which
+    /// [`craft_prc::ModelNode::placements`] ranges over, so a model tree can name, hide and pick
+    /// it. `None` for a file with no tree and for meshes made otherwise.
+    pub placement: Option<usize>,
 }
 
 impl WorldMesh {
     /// `mesh`, uncoloured.
     #[must_use]
     pub fn new(mesh: TriangleMesh) -> Self {
-        WorldMesh { mesh, colour: None, triangle_colours: None }
+        WorldMesh { mesh, colour: None, triangle_colours: None, placement: None }
     }
 
     /// The colour triangle `t` draws in, before the render options' default.
@@ -39,7 +43,7 @@ impl WorldMesh {
 /// `mesh` moved into the world by `matrix`, drawn in `colour` and, per triangle, `triangle_colours`.
 #[must_use]
 pub fn place(mesh: &TriangleMesh, matrix: &Matrix, colour: Option<[u8; 4]>, triangle_colours: Option<Vec<Option<[u8; 4]>>>) -> WorldMesh {
-    WorldMesh { mesh: mesh.transformed(matrix), colour, triangle_colours }
+    WorldMesh { mesh: mesh.transformed(matrix), colour, triangle_colours, placement: None }
 }
 
 /// Every triangle mesh `prc` draws, in world coordinates and coloured as its product tree says
@@ -112,7 +116,7 @@ pub(crate) fn place_items<'a>(
     budget: &mut Budget,
     out: &mut Vec<WorldMesh>,
 ) -> Result<(), RenderError> {
-    for p in items {
+    for (index, p) in items.into_iter().enumerate() {
         let Some(tessellation) = tessellations.get(p.file_structure).and_then(|t| t.get(p.tessellation)) else {
             let what = format!("tessellation {} of file structure {}, which has none by that index", p.tessellation, p.file_structure);
             return Err(craft_prc::PrcError::Malformed(what).into());
@@ -122,7 +126,7 @@ pub(crate) fn place_items<'a>(
         };
         budget.spend(mesh)?;
         let triangle_colours = (p.triangle_colours)(mesh).map(|c| c.into_iter().map(|c| c.map(bytes)).collect());
-        out.push(place(mesh, &p.matrix, p.colour.map(bytes), triangle_colours));
+        out.push(WorldMesh { placement: Some(index), ..place(mesh, &p.matrix, p.colour.map(bytes), triangle_colours) });
     }
     Ok(())
 }

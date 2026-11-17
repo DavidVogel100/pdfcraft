@@ -4,7 +4,7 @@
 //! producer's winding is not trusted to face outward.
 
 use crate::WorldMesh;
-use crate::raster::{Target, View, ViewCorner, at};
+use crate::raster::{NO_ID, Target, View, ViewCorner, at, channel, pixel_index};
 use crate::vec3::{cross, dot, length, normalize, scale, span, sub, unit_cross};
 use craft_prc::TriangleMesh;
 use std::ops::Range;
@@ -366,11 +366,97 @@ pub enum RenderError {
 /// 0–180° or too small for a finite focal length, a non-positive orthographic height);
 /// [`RenderError::TooMuchWork`] past [`MAX_RENDER_WORK`].
 pub fn render(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions) -> Result<Image, RenderError> {
-    render_in(meshes, camera, options, None)
+    render_in(meshes, camera, options, &Look::default(), None).map(|f| f.image)
 }
 
-/// [`render`] with `workers` in place of the machine's choice (tests compare the two).
-fn render_in(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions, workers_override: Option<usize>) -> Result<Image, RenderError> {
+/// How [`render_look`] draws the meshes beyond the camera: some hidden, some highlighted, the
+/// model cut by a section plane. Each list is indexed like the meshes; a missing entry is false.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Look {
+    /// Meshes not drawn.
+    pub hidden: Vec<bool>,
+    /// Meshes tinted towards [`HIGHLIGHT`], as a viewer marks the picked part.
+    pub highlighted: Vec<bool>,
+    /// What lies past this plane is cut away.
+    pub section: Option<Section>,
+}
+
+impl Look {
+    fn hidden(&self, mesh: usize) -> bool {
+        self.hidden.get(mesh).copied().unwrap_or(false)
+    }
+
+    fn highlighted(&self, mesh: usize) -> bool {
+        self.highlighted.get(mesh).copied().unwrap_or(false)
+    }
+}
+
+/// A section plane: the points `p` with `normal · p > offset` (world coordinates) are cut away.
+/// Where it opens a part, the inside faces seen through the cut are drawn flat and darker, so a
+/// closed part reads as solid. A plane with a non-finite value cuts nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Section {
+    /// The direction from the kept side to the cut side; any length.
+    pub normal: [f64; 3],
+    /// Where the plane lies along `normal`, in its units.
+    pub offset: f64,
+}
+
+/// The colour [`Look::highlighted`] meshes are tinted towards.
+pub const HIGHLIGHT: [u8; 3] = [40, 130, 255];
+
+/// How much of [`HIGHLIGHT`] a highlighted mesh's colour takes.
+const HIGHLIGHT_SHARE: f64 = 0.65;
+
+/// The shade of an inside face seen through a section.
+const INSIDE_SHADE: f64 = 0.55;
+
+/// What [`render_look`] drew: the image, and which mesh each pixel shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    /// The picture.
+    pub image: Image,
+    /// Per pixel, row by row from the top, the index of the mesh drawn there last (a
+    /// translucent one over an opaque one counts); [`NO_ID`] where only the background shows.
+    ids: Vec<u32>,
+}
+
+impl Frame {
+    /// The mesh drawn at pixel (`x`, `y`), as a viewer picks the part under the pointer.
+    #[must_use]
+    pub fn mesh_at(&self, x: u32, y: u32) -> Option<usize> {
+        if x >= self.image.width || y >= self.image.height {
+            return None;
+        }
+        let i = pixel_index(self.image.width, x, y)?;
+        self.ids.get(i).copied().filter(|&id| id != NO_ID).and_then(|id| usize::try_from(id).ok())
+    }
+}
+
+/// [`render`] as `look` says, also saying which mesh each pixel shows.
+///
+/// # Errors
+/// As [`render`].
+pub fn render_look(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions, look: &Look) -> Result<Frame, RenderError> {
+    render_in(meshes, camera, options, look, None)
+}
+
+/// One worker's drawing: colours, depth keys and ids.
+struct Layer {
+    rgba: Vec<u8>,
+    depth: Vec<f64>,
+    ids: Vec<u32>,
+}
+
+/// [`render_look`] with `workers_override` in place of the machine's choice of workers (tests
+/// compare the two).
+fn render_in(
+    meshes: &[WorldMesh],
+    camera: &Camera,
+    options: &RenderOptions,
+    look: &Look,
+    workers_override: Option<usize>,
+) -> Result<Frame, RenderError> {
     let workers = |triangles: usize, pixels: usize| workers_override.unwrap_or_else(|| workers(triangles, pixels));
     let (width, height) = (options.width, options.height);
     let size = RenderError::Size { width, height };
@@ -381,66 +467,89 @@ fn render_in(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions, wor
     let pixels = usize::try_from(pixels).map_err(|_| size)?;
     let view = View::new(camera, f64::from(width) / f64::from(height))?;
     let perspective = matches!(view, View::Perspective { .. });
-    let scene = Scene { eye: camera.eye, basis: camera.basis()?, view, lighting: options.lighting };
+    let section = look.section.filter(|s| s.normal.iter().all(|v| v.is_finite()) && s.offset.is_finite());
+    let scene = Scene { eye: camera.eye, basis: camera.basis()?, view, lighting: options.lighting, section };
     let [r, g, b] = options.colour;
-    let colour_of = |m: &WorldMesh, t: usize| m.colour_of(t).unwrap_or([r, g, b, 255]);
+    let colour_of = |k: usize, m: &WorldMesh, t: usize| {
+        let c = m.colour_of(t).unwrap_or([r, g, b, 255]);
+        if look.highlighted(k) { tint(c) } else { c }
+    };
+    let id_of = |k: usize| u32::try_from(k).unwrap_or(NO_ID);
     let pool = AtomicU64::new(MAX_RENDER_WORK);
-    let layer = || (options.background.repeat(pixels), vec![f64::NEG_INFINITY; pixels]);
+    let layer = || Layer { rgba: options.background.repeat(pixels), depth: vec![f64::NEG_INFINITY; pixels], ids: vec![NO_ID; pixels] };
     // Opaque triangles, in order, shared out over workers that each draw a run of them into
     // their own layer; the layers are then merged in the same order.
-    let total: usize = meshes.iter().map(|m| m.mesh.triangles.len()).sum();
+    let total: usize = meshes.iter().enumerate().filter(|&(k, _)| !look.hidden(k)).map(|(_, m)| m.mesh.triangles.len()).sum();
     let runs = split(total, workers(total, pixels));
-    let draw_run = |run: Range<usize>, (rgba, depth): &mut (Vec<u8>, Vec<f64>)| -> Result<(), RenderError> {
-        let mut target = Target { perspective, width, height, rgba, depth, work: 0, pool: Some(&pool), rows: 0..height };
-        for (m, t) in triangles(meshes, run) {
-            let colour = colour_of(m, t);
+    let draw_run = |run: Range<usize>, l: &mut Layer| -> Result<(), RenderError> {
+        let mut target = Target {
+            perspective,
+            width,
+            height,
+            rgba: &mut l.rgba,
+            depth: &mut l.depth,
+            ids: &mut l.ids,
+            work: 0,
+            pool: Some(&pool),
+            rows: 0..height,
+        };
+        for (k, m, t) in triangles(meshes, look, run) {
+            let colour = colour_of(k, m, t);
             if colour[3] == 255 {
-                scene.draw(&mut target, &m.mesh, t, colour)?;
+                scene.draw(&mut target, &m.mesh, t, colour, id_of(k))?;
             }
         }
         Ok(())
     };
-    let mut layers: Vec<(Vec<u8>, Vec<f64>)> = runs.iter().map(|_| layer()).collect();
+    let mut layers: Vec<Layer> = runs.iter().map(|_| layer()).collect();
     in_parallel(&runs, &mut layers, &draw_run)?;
     let mut layers = layers.into_iter();
-    let (mut rgba, mut depth) = layers.next().unwrap_or_else(layer);
-    for (more_rgba, more_depth) in layers {
-        merge(&mut rgba, &mut depth, &more_rgba, &more_depth);
+    let mut out = layers.next().unwrap_or_else(layer);
+    for more in layers {
+        merge(&mut out, &more);
     }
     // Then the translucent ones, over everything opaque, in order: blending depends on order,
     // so these are shared out by bands of rows, each band drawing every one of them.
-    let translucent = |m: &WorldMesh, t: usize| {
-        let a = colour_of(m, t)[3];
+    let translucent = |k: usize, m: &WorldMesh, t: usize| {
+        let a = colour_of(k, m, t)[3];
         a != 255 && a != 0
     };
-    let count = meshes.iter().map(|m| (0..m.mesh.triangles.len()).filter(|&t| translucent(m, t)).count()).sum::<usize>();
+    let shown = || meshes.iter().enumerate().filter(|&(k, _)| !look.hidden(k));
+    let count = shown().map(|(k, m)| (0..m.mesh.triangles.len()).filter(|&t| translucent(k, m, t)).count()).sum::<usize>();
     if count > 0 {
         // Both sides are at most the image's pixel count, which fits a usize.
-        let (row_bytes, rows) = (usize::try_from(width).unwrap_or(0), usize::try_from(height).unwrap_or(0));
+        let (row_len, rows) = (usize::try_from(width).unwrap_or(0), usize::try_from(height).unwrap_or(0));
         let bands = split(rows, workers(count, 0).min(rows));
-        let mut rgba_rest: &mut [u8] = &mut rgba;
-        let mut depth_rest: &mut [f64] = &mut depth;
+        let (mut rgba_rest, mut depth_rest, mut ids_rest): (&mut [u8], &mut [f64], &mut [u32]) = (&mut out.rgba, &mut out.depth, &mut out.ids);
         let mut pieces = Vec::with_capacity(bands.len());
         for band in &bands {
-            let n = band.len() * row_bytes;
+            let n = band.len() * row_len;
             let (r, rest) = std::mem::take(&mut rgba_rest).split_at_mut(n * 4);
             let (d, drest) = std::mem::take(&mut depth_rest).split_at_mut(n);
-            (rgba_rest, depth_rest) = (rest, drest);
-            pieces.push((band.clone(), r, d));
+            let (i, irest) = std::mem::take(&mut ids_rest).split_at_mut(n);
+            (rgba_rest, depth_rest, ids_rest) = (rest, drest, irest);
+            pieces.push((band.clone(), r, d, i));
         }
-        let draw_band = |(rows, rgba, depth): &mut (Range<usize>, &mut [u8], &mut [f64])| -> Result<(), RenderError> {
+        let draw_band = |(rows, rgba, depth, ids): &mut (Range<usize>, &mut [u8], &mut [f64], &mut [u32])| -> Result<(), RenderError> {
             let rows = u32::try_from(rows.start).unwrap_or(0)..u32::try_from(rows.end).unwrap_or(0);
-            let mut target = Target { perspective, width, height, rgba, depth, work: 0, pool: Some(&pool), rows };
-            for m in meshes {
-                for t in (0..m.mesh.triangles.len()).filter(|&t| translucent(m, t)) {
-                    scene.draw(&mut target, &m.mesh, t, colour_of(m, t))?;
+            let mut target = Target { perspective, width, height, rgba, depth, ids, work: 0, pool: Some(&pool), rows };
+            for (k, m) in shown() {
+                for t in (0..m.mesh.triangles.len()).filter(|&t| translucent(k, m, t)) {
+                    scene.draw(&mut target, &m.mesh, t, colour_of(k, m, t), id_of(k))?;
                 }
             }
             Ok(())
         };
         each_in_parallel(&mut pieces, &draw_band)?;
     }
-    Ok(Image { width, height, rgba })
+    Ok(Frame { image: Image { width, height, rgba: out.rgba }, ids: out.ids })
+}
+
+/// `colour` tinted towards [`HIGHLIGHT`]; alpha kept.
+fn tint([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    let mix = |c: u8, h: u8| channel(f64::from(c) * (1.0 - HIGHLIGHT_SHARE) + f64::from(h) * HIGHLIGHT_SHARE);
+    let [hr, hg, hb] = HIGHLIGHT;
+    [mix(r, hr), mix(g, hg), mix(b, hb), a]
 }
 
 /// The most layers [`render`] draws at once, and the most memory they may take.
@@ -465,24 +574,25 @@ fn split(total: usize, parts: usize) -> Vec<Range<usize>> {
     (0..parts).map(|k| total * k / parts..total * (k + 1) / parts).collect()
 }
 
-/// The triangles numbered `run` when the meshes' triangles are counted one after another.
-fn triangles(meshes: &[WorldMesh], run: Range<usize>) -> impl Iterator<Item = (&WorldMesh, usize)> {
+/// The triangles numbered `run` when the shown meshes' triangles are counted one after another,
+/// each with its mesh's index.
+fn triangles<'m>(meshes: &'m [WorldMesh], look: &'m Look, run: Range<usize>) -> impl Iterator<Item = (usize, &'m WorldMesh, usize)> + 'm {
     let mut first = 0;
-    meshes.iter().flat_map(move |m| {
+    meshes.iter().enumerate().filter(move |&(k, _)| !look.hidden(k)).flat_map(move |(k, m)| {
         let n = m.mesh.triangles.len();
         let (lo, hi) = (run.start.saturating_sub(first).min(n), run.end.saturating_sub(first).min(n));
         first += n;
-        (lo..hi).map(move |t| (m, t))
+        (lo..hi).map(move |t| (k, m, t))
     })
 }
 
 /// Draw each run into its layer, on its own thread when there is more than one.
-fn in_parallel<F>(runs: &[Range<usize>], layers: &mut [(Vec<u8>, Vec<f64>)], draw: &F) -> Result<(), RenderError>
+fn in_parallel<F>(runs: &[Range<usize>], layers: &mut [Layer], draw: &F) -> Result<(), RenderError>
 where
-    F: Fn(Range<usize>, &mut (Vec<u8>, Vec<f64>)) -> Result<(), RenderError> + Sync,
+    F: Fn(Range<usize>, &mut Layer) -> Result<(), RenderError> + Sync,
 {
     let mut jobs: Vec<_> = runs.iter().cloned().zip(layers.iter_mut()).collect();
-    each_in_parallel(&mut jobs, &|(run, layer): &mut (Range<usize>, &mut (Vec<u8>, Vec<f64>))| draw(run.clone(), layer))
+    each_in_parallel(&mut jobs, &|(run, layer): &mut (Range<usize>, &mut Layer)| draw(run.clone(), layer))
 }
 
 /// Run `work` on every job, each on its own thread when there is more than one (one thread on
@@ -502,13 +612,16 @@ where
     jobs.iter_mut().try_for_each(work)
 }
 
-/// Merge a later layer into `rgba` and `depth`: its pixel wins where it is strictly nearer, as a
-/// later opaque triangle drawn into the same layer would.
-fn merge(rgba: &mut [u8], depth: &mut [f64], more_rgba: &[u8], more_depth: &[f64]) {
-    for ((d, px), (&md, mpx)) in depth.iter_mut().zip(rgba.as_chunks_mut::<4>().0).zip(more_depth.iter().zip(more_rgba.as_chunks::<4>().0)) {
+/// Merge a later layer into `out`: its pixel wins where it is strictly nearer, as a later opaque
+/// triangle drawn into the same layer would.
+fn merge(out: &mut Layer, more: &Layer) {
+    let mine = out.depth.iter_mut().zip(out.rgba.as_chunks_mut::<4>().0).zip(out.ids.iter_mut());
+    let theirs = more.depth.iter().zip(more.rgba.as_chunks::<4>().0).zip(&more.ids);
+    for (((d, px), id), ((&md, mpx), &mid)) in mine.zip(theirs) {
         if md > *d {
             *d = md;
             *px = *mpx;
+            *id = mid;
         }
     }
 }
@@ -520,9 +633,18 @@ struct Scene {
     basis: [[f64; 3]; 3],
     view: View,
     lighting: Lighting,
+    section: Option<Section>,
 }
 
 impl Scene {
+    /// From world point `p` towards the eye (orthographic: against the view direction).
+    fn towards_eye(&self, p: [f64; 3]) -> [f64; 3] {
+        match self.view {
+            View::Perspective { .. } => sub(self.eye, p),
+            View::Orthographic { .. } => scale(at3(&self.basis, 2), -1.0),
+        }
+    }
+
     /// The shade at world point `p` with normal `n`.
     fn shade(&self, p: [f64; 3], n: [f64; 3]) -> [f64; 3] {
         if self.lighting == Lighting::Unlit {
@@ -537,7 +659,7 @@ impl Scene {
 
     /// Draw triangle `t` of `mesh` into `target` in straight-RGBA `colour`; refused once the
     /// target's work allowance is spent.
-    fn draw(&self, target: &mut Target, mesh: &TriangleMesh, t: usize, colour: [u8; 4]) -> Result<(), RenderError> {
+    fn draw(&self, target: &mut Target, mesh: &TriangleMesh, t: usize, colour: [u8; 4], id: u32) -> Result<(), RenderError> {
         let Some(world) = mesh.triangles.get(t).and_then(|tri| corners(mesh, tri)) else {
             return Ok(());
         };
@@ -548,12 +670,17 @@ impl Scene {
         let normal = |k: usize| stored.and_then(|n| n.get(k).copied().flatten()).unwrap_or(face);
         // Without stored normals the triangle is flat: one shade, lit along the view ray to its first corner.
         let flat = stored.is_none().then(|| self.shade(at3(&world, 0), normal(0)));
+        // With a section on, a face turned away from the eye is the inside of a cut part: flat
+        // and darker, so the cut reads as solid.
+        let inside = self.section.is_some() && dot(face, self.towards_eye(at3(&world, 0))) < 0.0;
+        let flat = if inside { Some([INSIDE_SHADE; 3]) } else { flat };
+        let past = |p: [f64; 3]| self.section.map_or(0.0, |s| dot(s.normal, p) - s.offset);
         let [right, up, forward] = self.basis;
         let view_corners = [0, 1, 2].map(|k| -> ViewCorner {
             let p = at3(&world, k);
             let [r, g, b] = flat.unwrap_or_else(|| self.shade(p, normal(k)));
             let d = sub(p, self.eye);
-            [dot(d, right), dot(d, up), dot(d, forward), r, g, b]
+            [dot(d, right), dot(d, up), dot(d, forward), r, g, b, past(p)]
         });
         let clipped = self.view.clip(view_corners);
         let (width, height) = (target.width, target.height);
@@ -561,7 +688,7 @@ impl Scene {
         let mut screen = screen.fuse();
         if let (Some(a), Some(mut b)) = (screen.next(), screen.next()) {
             for c in screen {
-                target.fill([a, b, c], colour)?;
+                target.fill([a, b, c], colour, id, self.section.is_some())?;
                 b = c;
             }
         }

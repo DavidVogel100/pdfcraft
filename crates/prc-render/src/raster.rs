@@ -5,14 +5,17 @@ use crate::vec3::{length, sub};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// One view-space corner: x, y, z (z along the view direction), then its red, green and blue shade.
-pub(crate) type ViewCorner = [f64; 6];
+/// One view-space corner: x, y, z (z along the view direction), its red, green and blue shade,
+/// then how far it lies past the section plane (0 without one).
+pub(crate) type ViewCorner = [f64; 7];
 
 /// One screen-space corner: pixel x, pixel y and depth key, and its shade.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Corner {
     pub(crate) at: [f64; 3],
     pub(crate) shade: [f64; 3],
+    /// How far it lies past the section plane: positive is cut away.
+    pub(crate) cut: f64,
 }
 
 /// The perspective near plane, as a fraction of the eye-to-target distance.
@@ -63,7 +66,7 @@ impl View {
         let View::Perspective { near, .. } = *self else {
             return Clipped { corners: [tri[0], tri[1], tri[2], tri[2]], len: 3 };
         };
-        let mut out = Clipped { corners: [[0.0; 6]; 4], len: 0 };
+        let mut out = Clipped { corners: [[0.0; 7]; 4], len: 0 };
         for (k, &p) in tri.iter().enumerate() {
             let q = tri.get((k + 1) % 3).copied().unwrap_or(p);
             let z = |v: ViewCorner| v.get(2).copied().unwrap_or(0.0);
@@ -88,13 +91,13 @@ impl View {
 
     /// The screen corner of view corner `v`: pixel x, pixel y and a depth key that is linear
     /// in screen space and larger for nearer points.
-    pub(crate) fn project(&self, [x, y, z, r, g, b]: ViewCorner, width: u32, height: u32) -> Corner {
+    pub(crate) fn project(&self, [x, y, z, r, g, b, cut]: ViewCorner, width: u32, height: u32) -> Corner {
         let (nx, ny, key) = match *self {
             // Divided before multiplied, so an on-screen point's intermediate products stay finite.
             View::Perspective { focal, aspect, .. } => (x / z * focal / aspect, y / z * focal, 1.0 / z),
             View::Orthographic { half_height, aspect } => (x / half_height / aspect, y / half_height, -z),
         };
-        Corner { at: [(nx + 1.0) / 2.0 * f64::from(width), (1.0 - ny) / 2.0 * f64::from(height), key], shade: [r, g, b] }
+        Corner { at: [(nx + 1.0) / 2.0 * f64::from(width), (1.0 - ny) / 2.0 * f64::from(height), key], shade: [r, g, b], cut }
     }
 }
 
@@ -132,6 +135,8 @@ pub(crate) struct Target<'b> {
     pub(crate) height: u32,
     pub(crate) rgba: &'b mut [u8],
     pub(crate) depth: &'b mut [f64],
+    /// Per pixel, the id of what it shows ([`NO_ID`] for the background).
+    pub(crate) ids: &'b mut [u32],
     /// Pixel centres the fills may still test.
     pub(crate) work: u64,
     /// A work allowance shared with other targets drawing the same image, which [`Self::work`]
@@ -140,6 +145,9 @@ pub(crate) struct Target<'b> {
     /// The image rows this target holds and draws; `rgba` and `depth` start at the first.
     pub(crate) rows: Range<u32>,
 }
+
+/// The id of a pixel nothing is drawn at.
+pub(crate) const NO_ID: u32 = u32::MAX;
 
 /// How much work a target takes from a shared pool at a time.
 const WORK_CHUNK: u64 = 1 << 20;
@@ -151,7 +159,7 @@ impl Target<'_> {
     /// translucent one is blended over it, leaving the depth. The clipped bounding box's pixel
     /// centres are charged to [`Self::work`] first: [`RenderError::TooMuchWork`], with nothing
     /// drawn, when too few are left.
-    pub(crate) fn fill(&mut self, corners: [Corner; 3], colour: [u8; 4]) -> Result<(), RenderError> {
+    pub(crate) fn fill(&mut self, corners: [Corner; 3], colour: [u8; 4], id: u32, sectioned: bool) -> Result<(), RenderError> {
         let [a, b, c] = corners;
         let area = edge(a.at, b.at, c.at);
         let edges = [(b.at, c.at), (c.at, a.at), (a.at, b.at)];
@@ -169,6 +177,13 @@ impl Target<'_> {
         let flat = (a.shade == b.shade && b.shade == c.shade).then_some(a.shade);
         // Each corner's key, and its shade weighted for interpolation, once per triangle.
         let keys = corners.map(|c| at(c.at, 2));
+        // A triangle wholly past the section plane is left out; one partly past is cut pixel by pixel.
+        let cuts = corners.map(|c| c.cut);
+        if sectioned && cuts.iter().all(|&d| d > 0.0) {
+            return Ok(());
+        }
+        let cut_terms = [0, 1, 2].map(|k| at(cuts, k) * if self.perspective { at(keys, k) } else { 1.0 });
+        let partly_cut = sectioned && cuts.iter().any(|&d| d > 0.0);
         let shade_terms = corners.map(|c| [0, 1, 2].map(|j| if self.perspective { at(c.shade, j) * at(c.at, 2) } else { at(c.shade, j) }));
         for y in y0..=y1 {
             let py = f64::from(y) + 0.5;
@@ -189,6 +204,13 @@ impl Target<'_> {
                 }
                 let mix = |v: [f64; 3]| (-0.0 + at(w, 0) * at(v, 0) + at(w, 1) * at(v, 1)) + at(w, 2) * at(v, 2);
                 let key = mix(keys);
+                if partly_cut {
+                    // Perspective-correct, as the shade is: weights times 1/z, renormalised.
+                    let past = if self.perspective && key > 0.0 { mix(cut_terms) / key } else { mix(cuts) };
+                    if past > 0.0 {
+                        continue;
+                    }
+                }
                 let Some(i) = y.checked_sub(self.rows.start).and_then(|row| pixel_index(self.width, x, row)) else {
                     continue;
                 };
@@ -210,6 +232,9 @@ impl Target<'_> {
                     }
                 };
                 self.blend(i, key, shaded(colour, shade));
+                if let Some(slot) = self.ids.get_mut(i) {
+                    *slot = id;
+                }
             }
         }
         Ok(())
@@ -433,26 +458,36 @@ mod tests {
     fn a_shared_edge_is_cut_at_the_same_point_from_either_triangle() {
         // Cutting this edge from P towards Q and from Q towards P rounds differently.
         let view = View::Perspective { focal: 1.0, aspect: 1.0, near: 0.5 };
-        let (p, q) = ([0.1, 0.1, 0.2, 1.0, 1.0, 1.0], [0.7, 0.2, 1.6, 1.0, 1.0, 1.0]);
-        let one = view.clip([p, q, [0.0, 3.0, 2.0, 1.0, 1.0, 1.0]]);
+        let (p, q) = ([0.1, 0.1, 0.2, 1.0, 1.0, 1.0, 0.0], [0.7, 0.2, 1.6, 1.0, 1.0, 1.0, 0.0]);
+        let one = view.clip([p, q, [0.0, 3.0, 2.0, 1.0, 1.0, 1.0, 0.0]]);
         let one = one.as_slice();
-        let other = view.clip([q, p, [3.0, 0.0, 2.0, 1.0, 1.0, 1.0]]);
+        let other = view.clip([q, p, [3.0, 0.0, 2.0, 1.0, 1.0, 1.0, 0.0]]);
         let other = other.as_slice();
         let shared = one.iter().filter(|a| other.iter().any(|b| a[..3] == b[..3])).count();
         assert_eq!(shared, 2, "Q and the cut on PQ: {one:?} {other:?}");
     }
 
     fn corner(x: f64, y: f64, key: f64, shade: f64) -> Corner {
-        Corner { at: [x, y, key], shade: [shade; 3] }
+        Corner { at: [x, y, key], shade: [shade; 3], cut: 0.0 }
     }
 
     #[test]
     fn a_pixel_on_an_edge_two_triangles_share_is_blended_once() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
-        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX, pool: None, rows: 0..4 };
+        let mut t = Target {
+            perspective: false,
+            width: 4,
+            height: 4,
+            rgba: &mut rgba,
+            depth: &mut depth,
+            ids: &mut [NO_ID; 16],
+            work: u64::MAX,
+            pool: None,
+            rows: 0..4,
+        };
         let [a, b, c, d] = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)].map(|(x, y)| corner(x, y, 1.0, 1.0));
-        t.fill([a, b, c], [255, 0, 0, 128]).unwrap();
-        t.fill([a, c, d], [255, 0, 0, 128]).unwrap();
+        t.fill([a, b, c], [255, 0, 0, 128], 0, false).unwrap();
+        t.fill([a, c, d], [255, 0, 0, 128], 0, false).unwrap();
         // The diagonal runs through four pixel centres; each must look like the rest.
         for px in rgba.chunks(4) {
             assert_eq!(px, [255, 0, 0, 128]);
@@ -462,9 +497,19 @@ mod tests {
     #[test]
     fn a_perspective_shade_is_interpolated_on_the_surface_not_the_screen() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
-        let mut t = Target { perspective: true, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX, pool: None, rows: 0..4 };
+        let mut t = Target {
+            perspective: true,
+            width: 4,
+            height: 4,
+            rgba: &mut rgba,
+            depth: &mut depth,
+            ids: &mut [NO_ID; 16],
+            work: u64::MAX,
+            pool: None,
+            rows: 0..4,
+        };
         // The x = 4 corner is three times as far away as the others, and the only lit one.
-        t.fill([corner(0.0, 0.0, 1.0, 0.0), corner(4.0, 0.0, 1.0 / 3.0, 1.0), corner(0.0, 4.0, 1.0, 0.0)], [240, 240, 240, 255]).unwrap();
+        t.fill([corner(0.0, 0.0, 1.0, 0.0), corner(4.0, 0.0, 1.0 / 3.0, 1.0), corner(0.0, 4.0, 1.0, 0.0)], [240, 240, 240, 255], 0, false).unwrap();
         // At screen (1.5, 0.5) the weights are 0.5, 0.375, 0.125: on the surface the far corner
         // counts 0.125 / 0.75 = 1/6, where on the screen it would count 0.375.
         assert_eq!(rgba.get(4..8), Some(&[40, 40, 40, 255][..]));
@@ -474,11 +519,21 @@ mod tests {
     fn fills_stop_when_the_work_allowance_is_spent() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
         // Each fill's box is the whole 4x4 image: 16 pixel centres.
-        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: 40, pool: None, rows: 0..4 };
+        let mut t = Target {
+            perspective: false,
+            width: 4,
+            height: 4,
+            rgba: &mut rgba,
+            depth: &mut depth,
+            ids: &mut [NO_ID; 16],
+            work: 40,
+            pool: None,
+            rows: 0..4,
+        };
         let tri = [corner(0.0, 0.0, 1.0, 1.0), corner(4.0, 0.0, 1.0, 1.0), corner(0.0, 4.0, 1.0, 1.0)];
-        assert_eq!(t.fill(tri, [255, 0, 0, 255]), Ok(()));
-        assert_eq!(t.fill(tri, [255, 0, 0, 255]), Ok(()));
-        assert_eq!(t.fill(tri, [255, 0, 0, 255]), Err(RenderError::TooMuchWork));
+        assert_eq!(t.fill(tri, [255, 0, 0, 255], 0, false), Ok(()));
+        assert_eq!(t.fill(tri, [255, 0, 0, 255], 0, false), Ok(()));
+        assert_eq!(t.fill(tri, [255, 0, 0, 255], 0, false), Err(RenderError::TooMuchWork));
         assert_eq!(t.work, 8);
     }
 }

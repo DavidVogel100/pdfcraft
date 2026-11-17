@@ -92,6 +92,7 @@ fn each_placement_draws_its_tessellation_where_and_in_the_colour_the_tree_says()
     assert_eq!(out[1].mesh.positions, [[-4.0, 0.0, 0.0], [-3.0, 0.0, 0.0], [-4.0, 1.0, 0.0]]);
     assert_eq!(out[1].colour, None);
     assert_eq!(budget.triangles, 2, "each occurrence spends its triangles");
+    assert_eq!(out.iter().map(|m| m.placement).collect::<Vec<_>>(), [Some(0), Some(1)], "each mesh names its placement");
 }
 
 #[test]

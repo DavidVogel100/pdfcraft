@@ -422,9 +422,63 @@ fn drawing_on_several_cores_gives_the_same_picture_as_on_one() {
     for camera in
         [ortho(5.0), Camera { eye: [1.0, -2.0, 6.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 50.0 } }]
     {
-        let one = render_in(&meshes, &camera, &options, Some(1)).unwrap();
+        let one = render_in(&meshes, &camera, &options, &Look::default(), Some(1)).unwrap();
         for workers in [2, 3, 7] {
-            assert_eq!(render_in(&meshes, &camera, &options, Some(workers)).unwrap(), one, "{workers} workers");
+            assert_eq!(render_in(&meshes, &camera, &options, &Look::default(), Some(workers)).unwrap(), one, "{workers} workers");
         }
+    }
+}
+
+#[test]
+fn a_hidden_mesh_is_not_drawn_and_a_highlighted_one_is_tinted() {
+    // A near small square over a far large one, both facing the camera.
+    let meshes = [quad(1.0, 0.5, 0.0), quad(0.0, 1.5, 0.0)];
+    let plain = render_look(&meshes, &ortho(4.0), &small(), &Look::default()).unwrap();
+    assert_eq!(plain.image, render(&meshes, &ortho(4.0), &small()).unwrap(), "the default look draws as render does");
+    assert_eq!(plain.mesh_at(20, 20), Some(0), "the near square is in front");
+    assert_eq!(plain.mesh_at(8, 8), Some(1));
+    assert_eq!(plain.mesh_at(0, 0), None, "background");
+    assert_eq!(plain.mesh_at(40, 0), None, "off the image");
+    let hidden = render_look(&meshes, &ortho(4.0), &small(), &Look { hidden: vec![true], ..Look::default() }).unwrap();
+    assert_eq!(hidden.mesh_at(20, 20), Some(1), "with the near one hidden, the far one shows through");
+    let lit = render_look(&meshes, &ortho(4.0), &small(), &Look { highlighted: vec![false, true], ..Look::default() }).unwrap();
+    assert_eq!(pixel(&lit.image, 20, 20), pixel(&plain.image, 20, 20), "the unpicked square is unchanged");
+    let [r, g, b, _] = pixel(&lit.image, 8, 8);
+    assert!(b > r && b > g && (r, g, b) != (190, 192, 200), "the picked one leans blue: {r} {g} {b}");
+}
+
+#[test]
+fn a_section_cuts_away_what_lies_past_it_and_shows_insides_darker() {
+    // A box's front face (z = 1, wound towards the camera) and back face (z = -1, wound away
+    // from it on the far side, so its outside faces -z).
+    let front = mesh(vec![[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]], vec![[0, 1, 2], [0, 2, 3]]);
+    let back = mesh(vec![[-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0], [1.0, -1.0, -1.0]], vec![[0, 1, 2], [0, 2, 3]]);
+    let meshes = [WorldMesh::new(front), WorldMesh::new(back)];
+    let whole = render_look(&meshes, &ortho(4.0), &small(), &Look::default()).unwrap();
+    assert_eq!(whole.mesh_at(20, 20), Some(0));
+    // Cut away everything above z = 0: the front face goes, the back face's inside shows, dark.
+    let cut = Look { section: Some(Section { normal: [0.0, 0.0, 1.0], offset: 0.0 }), ..Look::default() };
+    let open = render_look(&meshes, &ortho(4.0), &small(), &cut).unwrap();
+    assert_eq!(open.mesh_at(20, 20), Some(1));
+    let inside = (f64::from(190u8) * INSIDE_SHADE).round() as u8;
+    assert_eq!(pixel(&open.image, 20, 20)[0], inside);
+    // A plane cutting across the front face keeps the half on the near side of it.
+    let half = Look { section: Some(Section { normal: [1.0, 0.0, 0.0], offset: 0.0 }), ..Look::default() };
+    let halved = render_look(&meshes, &ortho(4.0), &small(), &half).unwrap();
+    assert_eq!(halved.mesh_at(12, 20), Some(0), "x < 0 kept");
+    assert_eq!(halved.mesh_at(28, 20), None, "x > 0 cut away, the back face with it");
+    // A plane with a non-finite value cuts nothing.
+    let bad = Look { section: Some(Section { normal: [f64::NAN, 0.0, 1.0], offset: 0.0 }), ..Look::default() };
+    assert_eq!(render_look(&meshes, &ortho(4.0), &small(), &bad).unwrap(), whole);
+}
+
+#[test]
+fn several_cores_pick_the_same_meshes_as_one() {
+    let meshes: Vec<WorldMesh> = (0..12).map(|k| quad(f64::from(k) * 0.1, 0.3 + f64::from(k) * 0.1, 0.05)).collect();
+    let look =
+        Look { hidden: vec![false, true], highlighted: vec![false, false, true], section: Some(Section { normal: [1.0, 0.2, 0.0], offset: 0.4 }) };
+    let one = render_in(&meshes, &ortho(4.0), &small(), &look, Some(1)).unwrap();
+    for workers in [2, 5] {
+        assert_eq!(render_in(&meshes, &ortho(4.0), &small(), &look, Some(workers)).unwrap(), one);
     }
 }
