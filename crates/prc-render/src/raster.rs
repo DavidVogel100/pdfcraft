@@ -2,6 +2,8 @@
 
 use crate::render::{Camera, Projection, RenderError};
 use crate::vec3::{length, sub};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One view-space corner: x, y, z (z along the view direction), then its red, green and blue shade.
 pub(crate) type ViewCorner = [f64; 6];
@@ -57,11 +59,11 @@ impl View {
 
     /// The part of `tri` in front of the near plane (Sutherland–Hodgman against one plane):
     /// 0, 3 or 4 corners, the shade interpolated along each cut edge.
-    pub(crate) fn clip(&self, tri: [ViewCorner; 3]) -> Vec<ViewCorner> {
+    pub(crate) fn clip(&self, tri: [ViewCorner; 3]) -> Clipped {
         let View::Perspective { near, .. } = *self else {
-            return tri.to_vec();
+            return Clipped { corners: [tri[0], tri[1], tri[2], tri[2]], len: 3 };
         };
-        let mut out = Vec::with_capacity(4);
+        let mut out = Clipped { corners: [[0.0; 6]; 4], len: 0 };
         for (k, &p) in tri.iter().enumerate() {
             let q = tri.get((k + 1) % 3).copied().unwrap_or(p);
             let z = |v: ViewCorner| v.get(2).copied().unwrap_or(0.0);
@@ -96,6 +98,26 @@ impl View {
     }
 }
 
+/// The corners [`View::clip`] leaves: at most four, as a triangle cut by one plane has.
+pub(crate) struct Clipped {
+    corners: [ViewCorner; 4],
+    len: usize,
+}
+
+impl Clipped {
+    fn push(&mut self, v: ViewCorner) {
+        if let Some(slot) = self.corners.get_mut(self.len) {
+            *slot = v;
+            self.len += 1;
+        }
+    }
+
+    /// The corners, in order.
+    pub(crate) fn as_slice(&self) -> &[ViewCorner] {
+        self.corners.get(..self.len).unwrap_or(&[])
+    }
+}
+
 /// Whether view corner `a`'s position comes before `b`'s, ordering x, then y, then z.
 fn first(a: &ViewCorner, b: &ViewCorner) -> bool {
     a.iter().zip(b).take(3).map(|(p, q)| p.total_cmp(q)).find(|o| o.is_ne()).is_none_or(std::cmp::Ordering::is_lt)
@@ -112,7 +134,15 @@ pub(crate) struct Target<'b> {
     pub(crate) depth: &'b mut [f64],
     /// Pixel centres the fills may still test.
     pub(crate) work: u64,
+    /// A work allowance shared with other targets drawing the same image, which [`Self::work`]
+    /// draws from when it runs short.
+    pub(crate) pool: Option<&'b AtomicU64>,
+    /// The image rows this target holds and draws; `rgba` and `depth` start at the first.
+    pub(crate) rows: Range<u32>,
 }
+
+/// How much work a target takes from a shared pool at a time.
+const WORK_CHUNK: u64 = 1 << 20;
 
 impl Target<'_> {
     /// Fill the screen triangle of `corners` with straight-RGBA `colour`, depth-tested at pixel
@@ -132,34 +162,82 @@ impl Target<'_> {
             return Ok(());
         };
         let span = |lo: u32, hi: u32| u64::from(hi.saturating_sub(lo)).saturating_add(1);
-        self.work = self.work.checked_sub(span(x0, x1).saturating_mul(span(y0, y1))).ok_or(RenderError::TooMuchWork)?;
+        self.charge(span(x0, x1).saturating_mul(span(y0, y1)))?;
+        // Only this target's rows are drawn: a band of the image, when it is drawn in bands.
+        let (y0, y1) = (y0.max(self.rows.start), y1.min(self.rows.end.saturating_sub(1)));
+        let lines = edges.map(|(from, to)| Line::new(from, to, area));
+        let flat = (a.shade == b.shade && b.shade == c.shade).then_some(a.shade);
+        // Each corner's key, and its shade weighted for interpolation, once per triangle.
+        let keys = corners.map(|c| at(c.at, 2));
+        let shade_terms = corners.map(|c| [0, 1, 2].map(|j| if self.perspective { at(c.shade, j) * at(c.at, 2) } else { at(c.shade, j) }));
         for y in y0..=y1 {
-            for x in x0..=x1 {
-                let p = [f64::from(x) + 0.5, f64::from(y) + 0.5, 0.0];
-                let w = edges.map(|(from, to)| edge(from, to, p) / area);
-                if w.iter().zip(edges).any(|(&k, (from, to))| k < 0.0 || (k == 0.0 && !owns(from, to, area))) {
+            let py = f64::from(y) + 0.5;
+            let rows = lines.map(|l| l.row(py));
+            let Some((xa, xb)) = row_span(&rows, x0, x1) else {
+                continue;
+            };
+            for x in xa..=xb {
+                let px = f64::from(x) + 0.5;
+                // Each test is the same arithmetic as `edge(from, to, p) / area`, so a pixel is
+                // drawn exactly when it would be pixel by pixel over the whole box.
+                let w = [0, 1, 2].map(|k| rows.get(k).map_or(0.0, |r| r.weight(px)));
+                if (0..3).any(|k| {
+                    let wk = w.get(k).copied().unwrap_or(0.0);
+                    wk < 0.0 || (wk == 0.0 && !lines.get(k).is_some_and(|l| l.owns))
+                }) {
                     continue;
                 }
-                let mix = |f: &dyn Fn(&Corner) -> f64| w.iter().zip(&corners).map(|(k, c)| k * f(c)).sum::<f64>();
-                let key = mix(&|c| at(c.at, 2));
-                let Some(i) = pixel_index(self.width, x, y) else {
+                let mix = |v: [f64; 3]| (-0.0 + at(w, 0) * at(v, 0) + at(w, 1) * at(v, 1)) + at(w, 2) * at(v, 2);
+                let key = mix(keys);
+                let Some(i) = y.checked_sub(self.rows.start).and_then(|row| pixel_index(self.width, x, row)) else {
                     continue;
                 };
                 if self.depth.get(i).is_none_or(|&d| key <= d) {
                     continue;
                 }
-                let shade = if a.shade == b.shade && b.shade == c.shade {
-                    a.shade
-                } else if self.perspective && key > 0.0 {
-                    // Screen weights times 1/z, renormalised, are the surface's own weights.
-                    [0, 1, 2].map(|j| mix(&|c| at(c.shade, j) * at(c.at, 2)) / key)
-                } else {
-                    [0, 1, 2].map(|j| mix(&|c| at(c.shade, j)))
+                let shade = match flat {
+                    Some(s) => s,
+                    None => {
+                        let channel_of = |j: usize| mix(shade_terms.map(|t| at(t, j)));
+                        if self.perspective && key > 0.0 {
+                            // Screen weights times 1/z, renormalised, are the surface's own weights.
+                            [0, 1, 2].map(|j| channel_of(j) / key)
+                        } else if self.perspective {
+                            [0, 1, 2].map(|j| mix(corners.map(|c| at(c.shade, j))))
+                        } else {
+                            [0, 1, 2].map(channel_of)
+                        }
+                    }
                 };
                 self.blend(i, key, shaded(colour, shade));
             }
         }
         Ok(())
+    }
+
+    /// Take `cost` from [`Self::work`], topping it up from [`Self::pool`] when short.
+    fn charge(&mut self, cost: u64) -> Result<(), RenderError> {
+        if let Some(rest) = self.work.checked_sub(cost) {
+            self.work = rest;
+            return Ok(());
+        }
+        let needed = cost - self.work;
+        let pool = self.pool.ok_or(RenderError::TooMuchWork)?;
+        let mut left = pool.load(Ordering::Relaxed);
+        loop {
+            if left < needed {
+                return Err(RenderError::TooMuchWork);
+            }
+            let taken = needed.max(WORK_CHUNK).min(left);
+            match pool.compare_exchange_weak(left, left - taken, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    // `taken` covers what `work` lacked, so this doesn't underflow.
+                    self.work = taken - needed;
+                    return Ok(());
+                }
+                Err(now) => left = now,
+            }
+        }
     }
 
     /// The pixel rows and columns `corners` may cover, clipped to the image; `None` when off it.
@@ -228,6 +306,89 @@ pub(crate) fn edge(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> f64 {
     (at(b, 0) - at(a, 0)) * (at(p, 1) - at(a, 1)) - (at(b, 1) - at(a, 1)) * (at(p, 0) - at(a, 0))
 }
 
+/// One edge of a triangle being filled, set up once so each pixel's test is cheap: the same
+/// canonical order as [`edge`], so its values are the ones [`edge`] gives.
+#[derive(Clone, Copy)]
+struct Line {
+    /// The canonical start point, x and y.
+    ax: f64,
+    ay: f64,
+    /// `b - a`, canonical order.
+    dx: f64,
+    dy: f64,
+    /// -1 when the canonical order reverses the edge, else 1.
+    sign: f64,
+    area: f64,
+    /// Whether a pixel centre exactly on the edge is the triangle's ([`owns`]).
+    owns: bool,
+}
+
+/// A [`Line`] on one pixel row: what is left of [`edge`] once y is fixed.
+#[derive(Clone, Copy)]
+struct RowLine {
+    line: Line,
+    /// `dx * (py - ay)`.
+    across: f64,
+}
+
+impl Line {
+    fn new(from: [f64; 3], to: [f64; 3], area: f64) -> Line {
+        let owns = owns(from, to, area);
+        let ((a, b), sign) = if (at(from, 0), at(from, 1)) > (at(to, 0), at(to, 1)) { ((to, from), -1.0) } else { ((from, to), 1.0) };
+        Line { ax: at(a, 0), ay: at(a, 1), dx: at(b, 0) - at(a, 0), dy: at(b, 1) - at(a, 1), sign, area, owns }
+    }
+
+    fn row(self, py: f64) -> RowLine {
+        RowLine { line: self, across: self.dx * (py - self.ay) }
+    }
+}
+
+impl RowLine {
+    /// The corner weight this edge gives pixel centre `px` on the row: `edge(from, to, p) / area`.
+    fn weight(&self, px: f64) -> f64 {
+        let l = self.line;
+        let e = self.across - l.dy * (px - l.ax);
+        // `edge` negates the canonical value when it swapped the ends.
+        (if l.sign < 0.0 { -e } else { e }) / l.area
+    }
+
+    /// The pixel centres on the row where the weight may be at least 0, as a closed range of x
+    /// (unbounded when the edge doesn't limit x); padded, as the exact test decides.
+    fn reach(&self) -> (f64, f64) {
+        let l = self.line;
+        // weight(px) = s * (across - dy * (px - ax)), with s = sign / area.
+        let slope = -l.dy * l.sign / l.area;
+        let at_ax = self.across * l.sign / l.area;
+        if slope == 0.0 || !slope.is_finite() {
+            return if at_ax >= 0.0 || !at_ax.is_finite() { (f64::NEG_INFINITY, f64::INFINITY) } else { (f64::INFINITY, f64::NEG_INFINITY) };
+        }
+        let root = l.ax - at_ax / slope;
+        if slope > 0.0 { (root, f64::INFINITY) } else { (f64::NEG_INFINITY, root) }
+    }
+}
+
+/// The pixels `x0..=x1` of a row that may lie inside all three edges, or `None` when none can.
+/// Each end is widened by two pixels against rounding; the exact per-pixel test decides.
+fn row_span(rows: &[RowLine; 3], x0: u32, x1: u32) -> Option<(u32, u32)> {
+    let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+    for r in rows {
+        let (a, b) = r.reach();
+        lo = lo.max(a);
+        hi = hi.min(b);
+    }
+    if lo.is_nan() || hi.is_nan() {
+        return Some((x0, x1));
+    }
+    // Pixel x's centre is x + 0.5.
+    let first = (lo - 0.5).floor() - 2.0;
+    let last = (hi - 0.5).ceil() + 2.0;
+    if last < f64::from(x0) || first > f64::from(x1) || first > last {
+        return None;
+    }
+    // Clamped into x0..=x1 first, so the casts are exact.
+    Some((first.max(f64::from(x0)) as u32, last.min(f64::from(x1)) as u32))
+}
+
 /// Whether a pixel centre exactly on the edge `from`-`to` of a triangle of signed doubled area
 /// `area` is the triangle's: the side the triangle grows towards, +x first, then +y. Two
 /// triangles sharing the edge lie on opposite sides of it, so exactly one owns it.
@@ -274,7 +435,9 @@ mod tests {
         let view = View::Perspective { focal: 1.0, aspect: 1.0, near: 0.5 };
         let (p, q) = ([0.1, 0.1, 0.2, 1.0, 1.0, 1.0], [0.7, 0.2, 1.6, 1.0, 1.0, 1.0]);
         let one = view.clip([p, q, [0.0, 3.0, 2.0, 1.0, 1.0, 1.0]]);
+        let one = one.as_slice();
         let other = view.clip([q, p, [3.0, 0.0, 2.0, 1.0, 1.0, 1.0]]);
+        let other = other.as_slice();
         let shared = one.iter().filter(|a| other.iter().any(|b| a[..3] == b[..3])).count();
         assert_eq!(shared, 2, "Q and the cut on PQ: {one:?} {other:?}");
     }
@@ -286,7 +449,7 @@ mod tests {
     #[test]
     fn a_pixel_on_an_edge_two_triangles_share_is_blended_once() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
-        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX };
+        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX, pool: None, rows: 0..4 };
         let [a, b, c, d] = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)].map(|(x, y)| corner(x, y, 1.0, 1.0));
         t.fill([a, b, c], [255, 0, 0, 128]).unwrap();
         t.fill([a, c, d], [255, 0, 0, 128]).unwrap();
@@ -299,7 +462,7 @@ mod tests {
     #[test]
     fn a_perspective_shade_is_interpolated_on_the_surface_not_the_screen() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
-        let mut t = Target { perspective: true, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX };
+        let mut t = Target { perspective: true, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: u64::MAX, pool: None, rows: 0..4 };
         // The x = 4 corner is three times as far away as the others, and the only lit one.
         t.fill([corner(0.0, 0.0, 1.0, 0.0), corner(4.0, 0.0, 1.0 / 3.0, 1.0), corner(0.0, 4.0, 1.0, 0.0)], [240, 240, 240, 255]).unwrap();
         // At screen (1.5, 0.5) the weights are 0.5, 0.375, 0.125: on the surface the far corner
@@ -311,7 +474,7 @@ mod tests {
     fn fills_stop_when_the_work_allowance_is_spent() {
         let (mut rgba, mut depth) = (vec![0; 64], vec![f64::NEG_INFINITY; 16]);
         // Each fill's box is the whole 4x4 image: 16 pixel centres.
-        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: 40 };
+        let mut t = Target { perspective: false, width: 4, height: 4, rgba: &mut rgba, depth: &mut depth, work: 40, pool: None, rows: 0..4 };
         let tri = [corner(0.0, 0.0, 1.0, 1.0), corner(4.0, 0.0, 1.0, 1.0), corner(0.0, 4.0, 1.0, 1.0)];
         assert_eq!(t.fill(tri, [255, 0, 0, 255]), Ok(()));
         assert_eq!(t.fill(tri, [255, 0, 0, 255]), Ok(()));

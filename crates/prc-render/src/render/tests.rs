@@ -400,3 +400,31 @@ fn unusable_saved_views_are_refused() {
     let nan = [f64::NAN, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
     assert!(Camera::from_view(nan, 1.0, lens, [1.0, 1.0], [0.0; 3]).is_err());
 }
+
+#[test]
+fn drawing_on_several_cores_gives_the_same_picture_as_on_one() {
+    // A field of small overlapping triangles at many depths, some see-through, so ties, depth
+    // order and blending all matter, cut into runs and bands at awkward places.
+    let mut meshes = Vec::new();
+    for k in 0..40u32 {
+        let (mut positions, mut triangles) = (Vec::new(), Vec::new());
+        for i in 0..60u32 {
+            let f = f64::from(k * 60 + i);
+            let (x, y, z) = ((f * 0.37).sin() * 1.5, (f * 0.53).cos() * 1.5, (f * 0.11).sin());
+            let n = u32::try_from(positions.len()).unwrap();
+            positions.extend([[x, y, z], [x + 0.6, y + 0.1, z + 0.2], [x + 0.2, y + 0.7, z - 0.1]]);
+            triangles.push([n, n + 1, n + 2]);
+        }
+        let alpha = if k % 5 == 0 { 120 } else { 255 };
+        meshes.push(painted(WorldMesh::new(mesh(positions, triangles)), Some([(k * 6) as u8, 200, 90, alpha])));
+    }
+    let options = RenderOptions { width: 61, height: 47, ..RenderOptions::default() };
+    for camera in
+        [ortho(5.0), Camera { eye: [1.0, -2.0, 6.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 50.0 } }]
+    {
+        let one = render_in(&meshes, &camera, &options, Some(1)).unwrap();
+        for workers in [2, 3, 7] {
+            assert_eq!(render_in(&meshes, &camera, &options, Some(workers)).unwrap(), one, "{workers} workers");
+        }
+    }
+}
