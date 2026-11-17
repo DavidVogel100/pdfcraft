@@ -4,9 +4,11 @@
 //! producer's winding is not trusted to face outward.
 
 use crate::WorldMesh;
-use crate::raster::{Corner, Target, View, ViewCorner, at};
+use crate::raster::{Target, View, ViewCorner, at};
 use crate::vec3::{cross, dot, length, normalize, scale, span, sub, unit_cross};
 use craft_prc::TriangleMesh;
+use std::ops::Range;
+use std::sync::atomic::AtomicU64;
 
 /// The largest image [`render`] draws, in pixels (width × height).
 pub const MAX_RENDER_PIXELS: u64 = 16 * 1024 * 1024;
@@ -278,6 +280,12 @@ pub enum RenderError {
 /// 0–180° or too small for a finite focal length, a non-positive orthographic height);
 /// [`RenderError::TooMuchWork`] past [`MAX_RENDER_WORK`].
 pub fn render(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions) -> Result<Image, RenderError> {
+    render_in(meshes, camera, options, None)
+}
+
+/// [`render`] with `workers` in place of the machine's choice (tests compare the two).
+fn render_in(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions, workers_override: Option<usize>) -> Result<Image, RenderError> {
+    let workers = |triangles: usize, pixels: usize| workers_override.unwrap_or_else(|| workers(triangles, pixels));
     let (width, height) = (options.width, options.height);
     let size = RenderError::Size { width, height };
     let pixels = u64::from(width) * u64::from(height);
@@ -288,21 +296,135 @@ pub fn render(meshes: &[WorldMesh], camera: &Camera, options: &RenderOptions) ->
     let view = View::new(camera, f64::from(width) / f64::from(height))?;
     let perspective = matches!(view, View::Perspective { .. });
     let scene = Scene { eye: camera.eye, basis: camera.basis()?, view, lighting: options.lighting };
-    let mut rgba = options.background.repeat(pixels);
-    let mut depth = vec![f64::NEG_INFINITY; pixels];
-    let mut target = Target { perspective, width, height, rgba: &mut rgba, depth: &mut depth, work: MAX_RENDER_WORK };
     let [r, g, b] = options.colour;
-    for opaque in [true, false] {
-        for m in meshes {
-            for t in 0..m.mesh.triangles.len() {
-                let colour = m.colour_of(t).unwrap_or([r, g, b, 255]);
-                if (colour[3] == 255) == opaque && colour[3] != 0 {
-                    scene.draw(&mut target, &m.mesh, t, colour)?;
-                }
+    let colour_of = |m: &WorldMesh, t: usize| m.colour_of(t).unwrap_or([r, g, b, 255]);
+    let pool = AtomicU64::new(MAX_RENDER_WORK);
+    let layer = || (options.background.repeat(pixels), vec![f64::NEG_INFINITY; pixels]);
+    // Opaque triangles, in order, shared out over workers that each draw a run of them into
+    // their own layer; the layers are then merged in the same order.
+    let total: usize = meshes.iter().map(|m| m.mesh.triangles.len()).sum();
+    let runs = split(total, workers(total, pixels));
+    let draw_run = |run: Range<usize>, (rgba, depth): &mut (Vec<u8>, Vec<f64>)| -> Result<(), RenderError> {
+        let mut target = Target { perspective, width, height, rgba, depth, work: 0, pool: Some(&pool), rows: 0..height };
+        for (m, t) in triangles(meshes, run) {
+            let colour = colour_of(m, t);
+            if colour[3] == 255 {
+                scene.draw(&mut target, &m.mesh, t, colour)?;
             }
         }
+        Ok(())
+    };
+    let mut layers: Vec<(Vec<u8>, Vec<f64>)> = runs.iter().map(|_| layer()).collect();
+    in_parallel(&runs, &mut layers, &draw_run)?;
+    let mut layers = layers.into_iter();
+    let (mut rgba, mut depth) = layers.next().unwrap_or_else(layer);
+    for (more_rgba, more_depth) in layers {
+        merge(&mut rgba, &mut depth, &more_rgba, &more_depth);
+    }
+    // Then the translucent ones, over everything opaque, in order: blending depends on order,
+    // so these are shared out by bands of rows, each band drawing every one of them.
+    let translucent = |m: &WorldMesh, t: usize| {
+        let a = colour_of(m, t)[3];
+        a != 255 && a != 0
+    };
+    let count = meshes.iter().map(|m| (0..m.mesh.triangles.len()).filter(|&t| translucent(m, t)).count()).sum::<usize>();
+    if count > 0 {
+        // Both sides are at most the image's pixel count, which fits a usize.
+        let (row_bytes, rows) = (usize::try_from(width).unwrap_or(0), usize::try_from(height).unwrap_or(0));
+        let bands = split(rows, workers(count, 0).min(rows));
+        let mut rgba_rest: &mut [u8] = &mut rgba;
+        let mut depth_rest: &mut [f64] = &mut depth;
+        let mut pieces = Vec::with_capacity(bands.len());
+        for band in &bands {
+            let n = band.len() * row_bytes;
+            let (r, rest) = std::mem::take(&mut rgba_rest).split_at_mut(n * 4);
+            let (d, drest) = std::mem::take(&mut depth_rest).split_at_mut(n);
+            (rgba_rest, depth_rest) = (rest, drest);
+            pieces.push((band.clone(), r, d));
+        }
+        let draw_band = |(rows, rgba, depth): &mut (Range<usize>, &mut [u8], &mut [f64])| -> Result<(), RenderError> {
+            let rows = u32::try_from(rows.start).unwrap_or(0)..u32::try_from(rows.end).unwrap_or(0);
+            let mut target = Target { perspective, width, height, rgba, depth, work: 0, pool: Some(&pool), rows };
+            for m in meshes {
+                for t in (0..m.mesh.triangles.len()).filter(|&t| translucent(m, t)) {
+                    scene.draw(&mut target, &m.mesh, t, colour_of(m, t))?;
+                }
+            }
+            Ok(())
+        };
+        each_in_parallel(&mut pieces, &draw_band)?;
     }
     Ok(Image { width, height, rgba })
+}
+
+/// The most layers [`render`] draws at once, and the most memory they may take.
+const MAX_WORKERS: usize = 8;
+const MAX_LAYER_BYTES: usize = 256 << 20;
+
+/// How many workers draw `triangles` into images of `pixels`: one per core, up to
+/// [`MAX_WORKERS`], each with at least 50,000 triangles and their layers within [`MAX_LAYER_BYTES`].
+fn workers(triangles: usize, pixels: usize) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    let cores = 1;
+    #[cfg(not(target_arch = "wasm32"))]
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // Bands of one image (`pixels` 0) take no extra memory.
+    let by_memory = if pixels == 0 { usize::MAX } else { MAX_LAYER_BYTES / pixels.saturating_mul(12) };
+    cores.min(MAX_WORKERS).min(triangles / 50_000).min(by_memory).max(1)
+}
+
+/// `0..total` cut into `parts` consecutive runs of near-equal length.
+fn split(total: usize, parts: usize) -> Vec<Range<usize>> {
+    let parts = parts.max(1);
+    (0..parts).map(|k| total * k / parts..total * (k + 1) / parts).collect()
+}
+
+/// The triangles numbered `run` when the meshes' triangles are counted one after another.
+fn triangles(meshes: &[WorldMesh], run: Range<usize>) -> impl Iterator<Item = (&WorldMesh, usize)> {
+    let mut first = 0;
+    meshes.iter().flat_map(move |m| {
+        let n = m.mesh.triangles.len();
+        let (lo, hi) = (run.start.saturating_sub(first).min(n), run.end.saturating_sub(first).min(n));
+        first += n;
+        (lo..hi).map(move |t| (m, t))
+    })
+}
+
+/// Draw each run into its layer, on its own thread when there is more than one.
+fn in_parallel<F>(runs: &[Range<usize>], layers: &mut [(Vec<u8>, Vec<f64>)], draw: &F) -> Result<(), RenderError>
+where
+    F: Fn(Range<usize>, &mut (Vec<u8>, Vec<f64>)) -> Result<(), RenderError> + Sync,
+{
+    let mut jobs: Vec<_> = runs.iter().cloned().zip(layers.iter_mut()).collect();
+    each_in_parallel(&mut jobs, &|(run, layer): &mut (Range<usize>, &mut (Vec<u8>, Vec<f64>))| draw(run.clone(), layer))
+}
+
+/// Run `work` on every job, each on its own thread when there is more than one (one thread on
+/// wasm32); the first error, if any.
+fn each_in_parallel<J: Send, F>(jobs: &mut [J], work: &F) -> Result<(), RenderError>
+where
+    F: Fn(&mut J) -> Result<(), RenderError> + Sync,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    if jobs.len() > 1 {
+        return std::thread::scope(|s| {
+            let handles: Vec<_> = jobs.iter_mut().map(|job| s.spawn(move || work(job))).collect();
+            // A worker that panicked has drawn nothing usable: the frame is refused as too much work.
+            handles.into_iter().map(|h| h.join().unwrap_or(Err(RenderError::TooMuchWork))).collect::<Result<Vec<()>, _>>().map(|_| ())
+        });
+    }
+    jobs.iter_mut().try_for_each(work)
+}
+
+/// Merge a later layer into `rgba` and `depth`: its pixel wins where it is strictly nearer, as a
+/// later opaque triangle drawn into the same layer would.
+fn merge(rgba: &mut [u8], depth: &mut [f64], more_rgba: &[u8], more_depth: &[f64]) {
+    for ((d, px), (&md, mpx)) in depth.iter_mut().zip(rgba.as_chunks_mut::<4>().0).zip(more_depth.iter().zip(more_rgba.as_chunks::<4>().0)) {
+        if md > *d {
+            *d = md;
+            *px = *mpx;
+        }
+    }
 }
 
 /// The camera a frame is drawn from, with its basis and projection.
@@ -347,12 +469,14 @@ impl Scene {
             let d = sub(p, self.eye);
             [dot(d, right), dot(d, up), dot(d, forward), r, g, b]
         });
-        let screen: Vec<Corner> = self.view.clip(view_corners).into_iter().map(|v| self.view.project(v, target.width, target.height)).collect();
-        if let Some((&a, rest)) = screen.split_first() {
-            for pair in rest.windows(2) {
-                if let [b, c] = pair {
-                    target.fill([a, *b, *c], colour)?;
-                }
+        let clipped = self.view.clip(view_corners);
+        let (width, height) = (target.width, target.height);
+        let screen = clipped.as_slice().iter().map(|&v| self.view.project(v, width, height));
+        let mut screen = screen.fuse();
+        if let (Some(a), Some(mut b)) = (screen.next(), screen.next()) {
+            for c in screen {
+                target.fill([a, b, c], colour)?;
+                b = c;
             }
         }
         Ok(())
