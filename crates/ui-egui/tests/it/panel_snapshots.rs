@@ -190,6 +190,8 @@ fn open(p: RightPanel) -> (Harness<'static, PdfCraftApp>, &'static str) {
         RightPanel::Attachments => "attachments",
         RightPanel::Signatures => "signatures",
         RightPanel::Tags => "tags",
+        // Needs a document with a 3D model, so not in [`ALL`]: the viewer's own tests cover it.
+        RightPanel::Model3d => "model",
         RightPanel::Accessibility => {
             let mut h = harness("none");
             assert!(h.state_mut().execute("a11y.check"));

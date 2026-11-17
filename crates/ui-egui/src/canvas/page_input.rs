@@ -1044,7 +1044,8 @@ pub(super) fn page_overlays(ui: &mut egui::Ui, view: &mut DocView, frame: &mut P
     // in Acrobat). Only what can be filled is marked: a read-only widget (its field's, or a
     // radio button's own) is left as it is drawn.
     paint_field_highlights(painter, &xf, info, form.as_slice(), i, view.highlight_fields);
-    crate::view3d_ui::paint(ui, &xf, info, i, doc, &mut view.view3d, pointer, paper);
+    let on = crate::view3d_ui::OnPage { xf: &xf, info, page: i, doc, paper };
+    crate::view3d_ui::paint(ui, &on, &mut view.view3d, pointer);
     // Links: the hand and the link's target, which count only for the tools that follow or
     // edit links (`Layer::reached_by`). Tips draw above the palette, so none shows while it is
     // open, even beside it. A click follows the link its press was on, released over it: one that

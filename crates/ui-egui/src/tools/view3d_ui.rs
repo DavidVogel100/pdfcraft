@@ -85,12 +85,6 @@ impl View3d {
     pub(crate) fn camera(&self, page: usize, index: usize) -> Option<Camera> {
         self.models.get(&(page, index)).and_then(|m| m.camera)
     }
-
-    /// The node picked in a shown model.
-    #[cfg(test)]
-    pub(crate) fn selected(&self, page: usize, index: usize) -> Option<usize> {
-        self.models.get(&(page, index)).and_then(|m| m.parts.selected)
-    }
 }
 
 /// Before the pages scroll: wheel movement over a model shown last frame is the model's, not the
@@ -193,18 +187,19 @@ pub(crate) fn page_input(
     true
 }
 
+/// The page whose models [`paint`] draws.
+pub(crate) struct OnPage<'a> {
+    pub(crate) xf: &'a PageXform,
+    pub(crate) info: &'a DocInfo,
+    pub(crate) page: usize,
+    pub(crate) doc: &'a pdfcraft_engine::Document,
+    /// The page's colour, which the outlines' colours follow.
+    pub(crate) paper: Color32,
+}
+
 /// Draws the page's models: the model where it is read, else its outline and what is happening.
-/// `paper` is the page's colour, which the outline's colours follow.
-pub(crate) fn paint(
-    ui: &egui::Ui,
-    xf: &PageXform,
-    info: &DocInfo,
-    page: usize,
-    doc: &pdfcraft_engine::Document,
-    view: &mut View3d,
-    pointer: Option<Pos2>,
-    paper: Color32,
-) {
+pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: Option<Pos2>) {
+    let OnPage { xf, info, page, doc, paper } = *on;
     let ctx = ui.ctx();
     // A model's box can reach past the crop box: nothing is drawn off the page.
     let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(xf.rect));

@@ -34,10 +34,10 @@ impl Scene {
         let tree = if prc.stores_tree() { prc.model_tree().unwrap_or_default() } else { Vec::new() };
         let mut nodes: Vec<Node> = tree.iter().map(|n| Node { name: n.label(), parent: n.parent, ..Node::default() }).collect();
         for k in 0..nodes.len() {
-            if let Some(p) = nodes.get(k).and_then(|n| n.parent).filter(|&p| p < k) {
-                if let Some(parent) = nodes.get_mut(p) {
-                    parent.children.push(k);
-                }
+            if let Some(p) = nodes.get(k).and_then(|n| n.parent).filter(|&p| p < k)
+                && let Some(parent) = nodes.get_mut(p)
+            {
+                parent.children.push(k);
             }
         }
         // A mesh belongs to the deepest node whose placements hold its own: the tree lists a

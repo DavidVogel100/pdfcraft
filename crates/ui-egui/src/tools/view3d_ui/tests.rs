@@ -41,10 +41,11 @@ fn pdf_with_model(prc: &[u8]) -> Vec<u8> {
 
 type Harness = egui_kittest::Harness<'static, PdfCraftApp>;
 
-/// The app showing the model, and where on screen the middle of it is.
+/// The app showing the model, and where on screen the middle of it is; at 60 frames a second,
+/// so two clicks a frame apart make a double-click.
 fn shown() -> (Harness, egui::Pos2) {
     let pdf = pdf_with_model(&unhex(TRIANGLE_PRC_HEX));
-    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 900.0)).build_eframe(move |_cc| {
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 900.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
         let mut app = PdfCraftApp::new();
         app.open_bytes("model.pdf", None, pdf.clone()).unwrap();
         app
@@ -131,14 +132,14 @@ fn a_drag_turns_the_model_a_shift_drag_moves_it_and_a_double_click_goes_back() {
     assert!(close(turned.target, moved.target), "a plain drag doesn't move it");
     assert!(!close(direction(&turned), direction(&moved)), "a plain drag turns it");
 
+    h.event(egui::Event::PointerMoved(at));
+    h.run_steps(1);
     for _ in 0..2 {
-        h.event(egui::Event::PointerMoved(at));
         h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
-        h.run_steps(1);
         h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
         h.run_steps(1);
     }
-    h.run_steps(2);
+    h.run_steps(3);
     assert_eq!(camera(&h), before, "a double-click goes back to the view it opened on");
 }
 
