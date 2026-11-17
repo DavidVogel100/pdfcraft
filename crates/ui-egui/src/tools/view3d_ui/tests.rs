@@ -152,3 +152,75 @@ fn a_document_with_a_model_opens_on_its_model_tree() {
     use egui_kittest::kittest::Queryable as _;
     h.get_by_label("This model has no named parts.");
 }
+
+/// Pictures of a real file in the viewer, for looking at by eye: the file in `VIEW3D_PDF`, the
+/// pictures into `VIEW3D_OUT`. `cargo test -p pdfcraft-ui-egui --lib view3d_pictures -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_pictures() {
+    use super::{Load, tree};
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    let mut at = None;
+    for _ in 0..6000 {
+        h.run_steps(2);
+        let v = &h.state().views[0];
+        if let (Some(r), Some(_)) = (v.page_screen_rect(0), v.view3d.camera(0, 0)) {
+            at = Some(r.center());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let at = at.expect("the model showed");
+    h.run_steps(4);
+    h.render().unwrap().save(out.join("1-opened.png")).unwrap();
+    drag(&mut h, at, egui::vec2(120.0, 40.0), egui::Modifiers::NONE);
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("2-turned.png")).unwrap();
+    // A click on the model picks the part under it, highlighted and named in the tree.
+    h.event(egui::Event::PointerMoved(at));
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("3-picked.png")).unwrap();
+    let picked = h.state().views[0].view3d.models.get(&(0, 0)).and_then(|m| m.parts.selected);
+    eprintln!("picked node {picked:?}");
+    // Hide the picked part.
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        if let Some(n) = m.parts.selected {
+            m.parts.hidden.insert(n);
+            m.parts.changed();
+        }
+    }
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("4-hidden.png")).unwrap();
+    {
+        let v = &mut h.state_mut().views[0].view3d;
+        v.section = tree::SectionState { on: true, plane: tree::Plane::Front, at: 0.5, flip: false };
+        for m in v.models.values_mut() {
+            m.parts.hidden.clear();
+            m.parts.changed();
+        }
+    }
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("5-section-front.png")).unwrap();
+    {
+        let v = &mut h.state_mut().views[0].view3d;
+        v.section = tree::SectionState { on: true, plane: tree::Plane::Right, at: 0.5, flip: false };
+        for m in v.models.values_mut() {
+            m.parts.changed();
+        }
+    }
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("6-section-right.png")).unwrap();
+    let v = &h.state().views[0].view3d;
+    assert!(v.models.values().all(|m| matches!(m.load, Load::Ready(_))));
+}
