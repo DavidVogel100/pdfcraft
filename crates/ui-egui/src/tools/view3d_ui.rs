@@ -18,11 +18,13 @@ use crate::canvas::PageXform;
 use crate::page_cursor::Layer;
 use crate::page_router::{Hit, Owner, PagePress};
 
+mod measure;
 mod scene;
 #[cfg(test)]
 mod tests;
 mod tree;
 
+pub(crate) use measure::measure_controls;
 use scene::Scene;
 pub(crate) use tree::{section_controls, tree_panel};
 
@@ -43,6 +45,8 @@ pub(crate) struct View3d {
     wheel: f32,
     /// The section view, for every model of the document.
     section: tree::SectionState,
+    /// The Measure tool is on: a click on a model picks a face to measure, not a part.
+    measuring: bool,
 }
 
 struct Model {
@@ -67,6 +71,8 @@ struct Model {
     screen: Option<Rect>,
     /// During a drag: whether it moves the model (else it turns it), decided as it starts.
     drag: Option<bool>,
+    /// The faces picked to measure, and what they read.
+    measure: measure::Measure,
     /// During a turn: the world point it turns about, the model's surface where it started.
     turn_about: Option<[f64; 3]>,
     /// Whether the model is drawn across its whole page, not only in its annotation's box: when
@@ -130,10 +136,12 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
         if whole { xf.rect } else { xf.user_rect(info, page, m.rect) }
     };
     let m = info.annots_3d.iter().rev().find(|m| m.page == page && area(m).contains(p) && view.ready(page, m.index))?;
-    Some(Hit {
-        tip: Some(tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset").into()),
-        ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, egui::CursorIcon::Grab)
-    })
+    let tip = if view.measuring {
+        tl!("Click a face to measure it, then another to measure between them")
+    } else {
+        tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset")
+    };
+    Some(Hit { tip: Some(tip.into()), ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, egui::CursorIcon::Grab) })
 }
 
 /// A press the model holds: drags turn or move it, a click picks a part, a double-click resets
@@ -148,6 +156,7 @@ pub(crate) fn page_input(
     cursor: &mut crate::page_cursor::PageCursor,
 ) -> bool {
     let PagePress::Mine(Owner::Model3d { index }) = press else { return false };
+    let measuring = view.measuring;
     let Some(m) = view.models.get_mut(&(page, index)) else { return false };
     let now = ui.input(|i| i.time);
     let height = f64::from(m.screen.map_or(400.0, |r| r.height()));
@@ -196,16 +205,25 @@ pub(crate) fn page_input(
     } else if resp.clicked()
         && let (Some(p), Some(r), Load::Ready(scene)) = (resp.interact_pointer_pos(), m.screen, &m.load)
     {
-        // Pick the part under the pointer, from the frame last drawn.
-        let picked = m.frame.as_ref().and_then(|f| {
+        // What lies under the pointer, from the frame last drawn: the mesh, and the point on it.
+        let under = m.frame.as_ref().zip(m.drawn).and_then(|(f, (drawn_with, _, _))| {
             let (w, h) = (f.image.width as f32, f.image.height as f32);
             let at = ((p.x - r.left()) / r.width().max(1.0) * w, (p.y - r.top()) / r.height().max(1.0) * h);
             // Inside the picture, so the casts are exact.
-            (at.0 >= 0.0 && at.1 >= 0.0).then(|| f.mesh_at(at.0 as u32, at.1 as u32)).flatten()
+            let (x, y) = (at.0 >= 0.0 && at.1 >= 0.0).then_some((at.0 as u32, at.1 as u32))?;
+            Some((f.mesh_at(x, y)?, f.point_at(x, y, &drawn_with)))
         });
-        let node = picked.and_then(|k| scene.mesh_nodes.get(k).copied().flatten());
         let scene = Arc::clone(scene);
-        m.parts.select(&scene, node);
+        if measuring {
+            // A click beside the model starts the measurement again.
+            match under {
+                Some((mesh, Some(point))) => m.measure.pick(&scene.meshes, mesh, point),
+                _ => m.measure.clear(),
+            }
+        } else {
+            let node = under.and_then(|(k, _)| scene.mesh_nodes.get(k).copied().flatten());
+            m.parts.select(&scene, node);
+        }
     }
     true
 }
@@ -254,6 +272,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             moving_until: 0.0,
             screen: None,
             drag: None,
+            measure: measure::Measure::default(),
             turn_about: None,
             whole_page: alone_on_page(doc, info, page, model),
         });
@@ -350,6 +369,9 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         }
         if let Some(t) = &m.texture {
             painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        if let Some((drawn_with, drawn_size, _)) = m.drawn {
+            measure::paint(&painter, r, drawn_size, &drawn_with, &m.measure, measure::Units::of(&scene));
         }
         // While a drag is on, say which it does: the system draws the same cursor for both on
         // Windows, so the frame and a corner label show it.

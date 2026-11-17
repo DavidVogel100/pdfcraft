@@ -192,6 +192,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 }
                 if panel == RightPanel::Model3d {
                     crate::view3d_ui::section_controls(ui, &t, &mut view.view3d);
+                    crate::view3d_ui::measure_controls(ui, &t, info, &mut view.view3d);
                 }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
                     RightPanel::Model3d => crate::view3d_ui::tree_panel(ui, &t, info, &mut view.view3d),

@@ -23,6 +23,8 @@ pub(crate) struct Scene {
     /// Per mesh, the node it belongs to.
     pub(crate) mesh_nodes: Vec<Option<usize>>,
     pub(crate) bounds: Option<Bounds>,
+    /// The model's unit, when the file says what it is.
+    pub(crate) units: Option<craft_prc::ModelUnits>,
 }
 
 impl Scene {
@@ -55,7 +57,8 @@ impl Scene {
             }
         }
         let bounds = Bounds::of(&meshes);
-        Ok(Scene { meshes, nodes, mesh_nodes, bounds })
+        let units = prc.units().ok().flatten();
+        Ok(Scene { meshes, nodes, mesh_nodes, bounds, units })
     }
 
     /// The nodes with no parent.

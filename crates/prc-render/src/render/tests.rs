@@ -501,3 +501,18 @@ fn the_point_under_a_pixel_is_where_the_surface_is_in_the_world() {
         assert_eq!(frame.point_at(40, 20, &camera), None, "off the image");
     }
 }
+
+#[test]
+fn a_point_projects_to_the_pixel_it_is_drawn_at() {
+    let meshes = [quad(1.0, 1.5, 0.0)];
+    for camera in
+        [ortho(4.0), Camera { eye: [0.0, 0.0, 10.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 30.0 } }]
+    {
+        let frame = render_look(&meshes, &camera, &small(), &Look::default()).unwrap();
+        let p = frame.point_at(26, 14, &camera).unwrap();
+        let [x, y] = camera.project(p, 40, 40).unwrap();
+        assert!((x - 26.5).abs() < 1e-9 && (y - 14.5).abs() < 1e-9, "{x} {y}");
+    }
+    let behind = Camera { eye: [0.0, 0.0, 10.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 30.0 } };
+    assert_eq!(behind.project([0.0, 0.0, 20.0], 40, 40), None);
+}

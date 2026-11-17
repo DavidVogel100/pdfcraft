@@ -183,6 +183,36 @@ fn a_document_with_a_model_opens_on_its_model_tree() {
     h.get_by_label("This model has no named parts.");
 }
 
+fn click(h: &mut Harness, p: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(p));
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(20);
+}
+
+/// With Measure on, a click picks the face under it instead of a part, a second click measures
+/// between the two, and a third starts again.
+#[test]
+fn measure_clicks_pick_faces_and_measure_between_them() {
+    let (mut h, at) = shown();
+    h.state_mut().views[0].view3d.measuring = true;
+    click(&mut h, at);
+    let picks = |h: &Harness| h.state().views[0].view3d.models.get(&(0, 0)).map_or(0, |m| m.measure.picks.len());
+    assert_eq!(picks(&h), 1);
+    assert_eq!(h.state().views[0].view3d.models.get(&(0, 0)).and_then(|m| m.parts.selected), None, "no part is selected");
+    click(&mut h, at + egui::vec2(6.0, 4.0));
+    assert_eq!(picks(&h), 2);
+    let readings = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().measure.readings.clone();
+    // Two points on the one flat triangle: the planes are the same, 0 apart.
+    assert!(
+        matches!(readings.first(), Some(pdfcraft_prc_render::measure::Reading::Distance { value, exact: true, .. }) if value.abs() < 1e-9),
+        "{readings:?}"
+    );
+    click(&mut h, at);
+    assert_eq!(picks(&h), 1, "a third click starts again");
+}
+
 /// Pictures of a real file in the viewer, for looking at by eye: the file in `VIEW3D_PDF`, the
 /// pictures into `VIEW3D_OUT`. `cargo test -p pdfcraft-ui-egui --lib view3d_pictures -- --ignored`
 #[test]
@@ -251,6 +281,23 @@ fn view3d_pictures() {
     }
     h.run_steps(30);
     h.render().unwrap().save(out.join("6-section-right.png")).unwrap();
+    // Measure: two clicks a little apart, then the readings.
+    {
+        let v = &mut h.state_mut().views[0].view3d;
+        v.section.on = false;
+        v.measuring = true;
+        for m in v.models.values_mut() {
+            m.parts.changed();
+        }
+    }
+    h.run_steps(30);
+    click(&mut h, at);
+    click(&mut h, at + egui::vec2(25.0, 30.0));
+    h.run_steps(10);
+    h.render().unwrap().save(out.join("7-measured.png")).unwrap();
+    for r in &h.state().views[0].view3d.models.get(&(0, 0)).unwrap().measure.readings {
+        eprintln!("reading {r:?}");
+    }
     let v = &h.state().views[0].view3d;
     assert!(v.models.values().all(|m| matches!(m.load, Load::Ready(_))));
 }

@@ -261,6 +261,25 @@ impl Camera {
         Ok(camera)
     }
 
+    /// Where world point `p` falls on a `width` × `height` picture this camera draws: pixel x
+    /// and y from the top left, as [`render`] places it. `None` when it is behind the eye or
+    /// nearer than a perspective camera's near plane, or the camera cannot form a view.
+    #[must_use]
+    pub fn project(&self, p: [f64; 3], width: u32, height: u32) -> Option<[f64; 2]> {
+        let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+        let view = View::new(self, w / h).ok()?;
+        let [right, up, forward] = self.basis().ok()?;
+        let d = sub(p, self.eye);
+        let z = dot(d, forward);
+        if let View::Perspective { near, .. } = view
+            && z < near
+        {
+            return None;
+        }
+        let at = view.project([dot(d, right), dot(d, up), z, 0.0, 0.0, 0.0, 0.0], width.max(1), height.max(1)).at;
+        (at[0].is_finite() && at[1].is_finite()).then_some([at[0], at[1]])
+    }
+
     /// Right, up and forward unit vectors.
     pub(crate) fn basis(&self) -> Result<[[f64; 3]; 3], RenderError> {
         let forward = normalize(sub(self.target, self.eye)).ok_or(RenderError::Camera("the eye and the target coincide"))?;
