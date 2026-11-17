@@ -164,7 +164,7 @@ fn edges_are_primary_finite_in_order_and_capped() {
 }
 
 /// The page modules: the per-page chain in `canvas::document_area` and what it calls.
-const PAGE_MODULES: [&str; 38] = [
+const PAGE_MODULES: [&str; 39] = [
     "canvas.rs",
     "canvas/page_input.rs",
     "canvas/area.rs",
@@ -203,6 +203,7 @@ const PAGE_MODULES: [&str; 38] = [
     "canvas/signature_drag.rs",
     "tools/calc_order_ui.rs",
     "tools/stamps_ui.rs",
+    "tools/view3d_ui.rs",
 ];
 
 /// What a file that acts on the pages uses: the pointer, a tool's or the comments' page context,
@@ -242,7 +243,7 @@ const RAW_READS: [&str; 21] = [
 
 /// Functions in the page modules that are not page input and read egui's pointer state
 /// themselves: (file, function, why).
-const NOT_PAGE_INPUT: [(&str, &str, &str); 13] = [
+const NOT_PAGE_INPUT: [(&str, &str, &str); 14] = [
     ("canvas/area.rs", "zoom_anchor", "a pinch zooms the whole view, and is read before the pages' widget exists"),
     ("canvas/area.rs", "drawing_edge_pointer", "scrolls the view at its edges, read before the pages' widget exists"),
     ("canvas/area.rs", "glide_interrupted", "a press anywhere stops the touchpad's glide"),
@@ -256,6 +257,7 @@ const NOT_PAGE_INPUT: [(&str, &str, &str); 13] = [
     ("tools/content_ui.rs", "editor", "the added-text editor is an Area of its own over the page"),
     ("tools/edit_text_ui.rs", "overlay", "the paragraph editor is an Area of its own over the page"),
     ("tools/fill_sign/scan.rs", "scan_tab", "the signature dialog's Scan tab"),
+    ("tools/view3d_ui.rs", "take_wheel", "the wheel over a 3D model zooms it, taken before the pages scroll and their widget exists"),
 ];
 
 /// The function a `fn` line declares, laid out as rustfmt does (`pub`, `const` and the like

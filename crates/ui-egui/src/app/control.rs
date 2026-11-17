@@ -72,6 +72,7 @@ impl PdfCraftApp {
                     "tags" => Some(RightPanel::Tags),
                     "search" => Some(RightPanel::Search),
                     "compare" => Some(RightPanel::Compare),
+                    "model" => Some(RightPanel::Model3d),
                     "none" => None,
                     other => return Err(format!("unknown panel {other}")),
                 }

@@ -1,0 +1,468 @@
+//! The Model Tree panel: a 3D model's assembly as a CAD feature tree lists it (assemblies and
+//! parts by name, nested, with their instance numbers as `Name<1>`), where a part can be picked,
+//! hidden, shown or isolated, and the section view that cuts the model by one of its three planes.
+
+use std::collections::HashSet;
+
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
+use pdfcraft_prc_render::{Look, Section};
+use pdfcraft_render::DocInfo;
+
+use super::scene::Scene;
+use super::{Load, View3d};
+use crate::icons;
+use crate::theme::{self, Tokens};
+
+/// Rows nest at most this deep in the panel; real assemblies are far shallower.
+const MAX_DEPTH: usize = 48;
+const ROW: f32 = 22.0;
+const INDENT: f32 = 14.0;
+
+/// What the user has done to one model's parts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Parts {
+    /// Nodes the user hid (with everything under them).
+    pub(crate) hidden: HashSet<usize>,
+    pub(crate) selected: Option<usize>,
+    /// Only this node (and what is under it) is shown.
+    pub(crate) isolated: Option<usize>,
+    pub(crate) expanded: HashSet<usize>,
+    /// A row to bring into view (a part picked on the page).
+    pub(crate) scroll_to: Option<usize>,
+    /// Bumped on every change, so the look is rebuilt and the model redrawn.
+    pub(crate) rev: u64,
+}
+
+impl Parts {
+    pub(crate) fn changed(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
+    }
+
+    /// Selects `node` (or nothing), opening the rows above it so it can be seen.
+    pub(crate) fn select(&mut self, scene: &Scene, node: Option<usize>) {
+        self.selected = node;
+        if let Some(n) = node {
+            let mut up = scene.nodes.get(n).and_then(|x| x.parent);
+            while let Some(p) = up {
+                self.expanded.insert(p);
+                up = scene.nodes.get(p).and_then(|x| x.parent);
+            }
+            self.scroll_to = Some(n);
+        }
+        self.changed();
+    }
+}
+
+/// The CAD plane a section cuts along, named as SOLIDWORKS names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Plane {
+    /// The XY plane: cuts along Z.
+    #[default]
+    Front,
+    /// The XZ plane: cuts along Y.
+    Top,
+    /// The YZ plane: cuts along X.
+    Right,
+}
+
+impl Plane {
+    fn axis(self) -> usize {
+        match self {
+            Self::Right => 0,
+            Self::Top => 1,
+            Self::Front => 2,
+        }
+    }
+}
+
+/// The section view, shared by the document's models.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SectionState {
+    pub(crate) on: bool,
+    pub(crate) plane: Plane,
+    /// Where the plane lies across the model's bounds along its axis, 0 to 1.
+    pub(crate) at: f32,
+    /// Cut away the other side.
+    pub(crate) flip: bool,
+}
+
+impl Default for SectionState {
+    fn default() -> Self {
+        Self { on: false, plane: Plane::Front, at: 0.5, flip: false }
+    }
+}
+
+impl SectionState {
+    /// The plane in model coordinates for a model within `lo`..`hi`.
+    pub(crate) fn section(&self, lo: [f64; 3], hi: [f64; 3]) -> Option<Section> {
+        if !self.on {
+            return None;
+        }
+        let k = self.plane.axis();
+        let (lo, hi) = (lo.get(k).copied().unwrap_or(0.0), hi.get(k).copied().unwrap_or(0.0));
+        let at = lo + (hi - lo) * f64::from(self.at.clamp(0.0, 1.0));
+        let mut normal = [0.0; 3];
+        if let Some(n) = normal.get_mut(k) {
+            *n = 1.0;
+        }
+        let (normal, offset) = if self.flip { (normal.map(|v: f64| -v), -at) } else { (normal, at) };
+        Some(Section { normal, offset })
+    }
+}
+
+/// How `scene` is drawn given what the user did to its parts and the section view.
+pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>) -> Look {
+    // Nodes come before the nodes under them, so one pass in order settles each from its parent.
+    let n = scene.nodes.len();
+    let (mut hidden, mut inside, mut picked) = (vec![false; n], vec![parts.isolated.is_none(); n], vec![false; n]);
+    for (i, node) in scene.nodes.iter().enumerate() {
+        let parent = node.parent.filter(|&p| p < i);
+        hidden[i] = parts.hidden.contains(&i) || parent.is_some_and(|p| hidden[p]);
+        inside[i] = parts.isolated.is_none() || parts.isolated == Some(i) || parent.is_some_and(|p| inside[p]);
+        picked[i] = parts.selected == Some(i) || parent.is_some_and(|p| picked[p]);
+    }
+    let of = |v: &[bool], node: Option<usize>, none: bool| node.and_then(|k| v.get(k).copied()).unwrap_or(none);
+    Look {
+        hidden: scene.mesh_nodes.iter().map(|&node| of(&hidden, node, false) || !of(&inside, node, parts.isolated.is_none())).collect(),
+        highlighted: scene.mesh_nodes.iter().map(|&node| of(&picked, node, false)).collect(),
+        section,
+    }
+}
+
+/// A node's name as SOLIDWORKS shows it: its instance number `-1` written `<1>`.
+pub(crate) fn display_name(name: &str) -> String {
+    match name.rsplit_once('-') {
+        Some((base, n)) if !base.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("{base}<{n}>"),
+        _ => name.to_owned(),
+    }
+}
+
+/// The rows under `node`: its children, looking through a configuration (SOLIDWORKS writes the
+/// active configuration, "Default", as the one occurrence directly under an assembly).
+pub(crate) fn shown_children(scene: &Scene, node: usize) -> &[usize] {
+    let Some(n) = scene.nodes.get(node) else { return &[] };
+    if let [only] = n.children.as_slice()
+        && let Some(c) = scene.nodes.get(*only)
+        && c.meshes.is_empty()
+        && !c.children.is_empty()
+        && display_name(&c.name) == c.name
+    {
+        return &c.children;
+    }
+    &n.children
+}
+
+/// Whether anything is drawn under `node`.
+fn has_meshes(scene: &Scene, node: usize) -> bool {
+    scene.subtree(node).into_iter().any(|k| scene.nodes.get(k).is_some_and(|n| !n.meshes.is_empty()))
+}
+
+/// The section view's controls, above the tree.
+pub(crate) fn section_controls(ui: &mut egui::Ui, t: &Tokens, view: &mut View3d) {
+    if !view.models.values().any(|m| matches!(m.load, Load::Ready(_))) {
+        return;
+    }
+    let before = view.section;
+    let s = &mut view.section;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add(icons::image("scissors", 16.0, t.icon));
+        ui.add(crate::widgets::checkbox(&mut s.on, egui::RichText::new(tl!("Section view")).font(theme::medium(13.0))));
+    });
+    if s.on {
+        ui.horizontal(|ui| {
+            for (plane, label) in [(Plane::Front, "Front"), (Plane::Top, "Top"), (Plane::Right, "Right")] {
+                ui.selectable_value(&mut s.plane, plane, tl!(label));
+            }
+            ui.add(crate::widgets::checkbox(&mut s.flip, tl!("Flip")));
+        });
+        ui.label(egui::RichText::new(tl!("Cut position")).color(t.text_muted).font(theme::regular(12.0)));
+        cut_slider(ui, t, &mut s.at).on_hover_text(tl!("Drag to move the cut through the model"));
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    if view.section != before {
+        for m in view.models.values_mut() {
+            m.parts.changed();
+        }
+    }
+}
+
+/// A slider for where the cut lies, 0 to 1: a track, filled up to the knob.
+fn cut_slider(ui: &mut egui::Ui, t: &Tokens, at: &mut f32) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(ui.available_width().max(80.0), 22.0), Sense::click_and_drag());
+    let (left, right) = (rect.left() + 8.0, rect.right() - 8.0);
+    if let Some(p) = resp.interact_pointer_pos()
+        && (resp.dragged() || resp.clicked())
+    {
+        let v = ((p.x - left) / (right - left).max(1.0)).clamp(0.0, 1.0);
+        if v != *at {
+            *at = v;
+            resp.mark_changed();
+        }
+    }
+    let x = left + (right - left) * at.clamp(0.0, 1.0);
+    let y = rect.center().y;
+    let painter = ui.painter();
+    painter.line_segment([pos2(left, y), pos2(right, y)], Stroke::new(4.0, t.border));
+    painter.line_segment([pos2(left, y), pos2(x, y)], Stroke::new(4.0, t.accent));
+    let hot = resp.hovered() || resp.dragged();
+    painter.circle(pos2(x, y), if hot { 8.0 } else { 7.0 }, t.card, Stroke::new(2.0, t.accent));
+    resp.widget_info(|| egui::WidgetInfo::slider(true, f64::from(*at), tl!("Cut position")));
+    theme::hand(resp)
+}
+
+/// The Model Tree: each shown 3D model's assembly.
+pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &mut View3d) {
+    let several = info.annots_3d.len() > 1;
+    let mut any = false;
+    for model in &info.annots_3d {
+        let Some(m) = view.models.get_mut(&(model.page, model.index)) else { continue };
+        let scene = match &m.load {
+            Load::Ready(scene) => std::sync::Arc::clone(scene),
+            Load::Pending(_) => {
+                ui.label(egui::RichText::new(tl!("Loading 3D model…")).color(t.text_muted));
+                any = true;
+                continue;
+            }
+            Load::Failed(_) => continue,
+        };
+        any = true;
+        if several {
+            let page = (model.page + 1).to_string();
+            ui.label(egui::RichText::new(crate::i18n::fmt(tl!("3D model on page {n}"), &[("n", &page)])).font(theme::semibold(13.0)));
+        }
+        let parts = &mut m.parts;
+        if scene.nodes.is_empty() {
+            ui.label(egui::RichText::new(tl!("This model has no named parts.")).color(t.text_muted));
+            continue;
+        }
+        if parts.isolated.is_some() || !parts.hidden.is_empty() {
+            ui.horizontal(|ui| {
+                if let Some(iso) = parts.isolated.and_then(|i| scene.nodes.get(i)) {
+                    let text = crate::i18n::fmt(tl!("Showing only {name}"), &[("name", &display_name(&iso.name))]);
+                    ui.label(egui::RichText::new(text).color(t.accent_text).font(theme::medium(12.0)));
+                }
+                if ui.button(tl!("Show all")).clicked() {
+                    parts.isolated = None;
+                    parts.hidden.clear();
+                    parts.changed();
+                }
+            });
+        }
+        for root in scene.roots().collect::<Vec<_>>() {
+            parts.expanded.insert(root);
+            row(ui, t, &scene, parts, root, 0, false);
+        }
+        ui.add_space(8.0);
+    }
+    if !any {
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.add(icons::image("compass", 36.0, t.text_faint));
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(tl!("Scroll to a 3D model to see its parts.")).color(t.text_muted));
+        });
+    }
+}
+
+/// One node's row and, when it is open, the rows under it.
+fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, node: usize, depth: usize, parent_hidden: bool) {
+    let Some(n) = scene.nodes.get(node) else { return };
+    let kids = shown_children(scene, node);
+    let open = parts.expanded.contains(&node);
+    let hidden = parent_hidden || parts.hidden.contains(&node);
+    let outside = parts.isolated.is_some_and(|iso| iso != node && !scene.subtree(iso).contains(&node) && !scene.subtree(node).contains(&iso));
+    let empty = !has_meshes(scene, node);
+    let selected = parts.selected == Some(node);
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    let name = display_name(&n.name);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::TreeItem, true, selected, &name));
+    if parts.scroll_to == Some(node) {
+        resp.scroll_to_me(Some(egui::Align::Center));
+        parts.scroll_to = None;
+    }
+    let press = theme::Press::track(ui, &resp);
+    press.wash(ui, rect, 4, selected);
+    let painter = ui.painter_at(rect);
+    let x = rect.left() + 2.0 + depth.min(MAX_DEPTH) as f32 * INDENT;
+    // The expander.
+    let arrow = Rect::from_min_size(pos2(x, rect.top() + 3.0), vec2(16.0, 16.0));
+    let mut toggled = false;
+    if !kids.is_empty() {
+        let arrow_resp = ui.interact(arrow, resp.id.with("expand"), Sense::click());
+        icons::paint(ui, arrow, if open { "chevron-down" } else { "chevron-right" }, 13.0, t.text_muted);
+        if arrow_resp.clicked() {
+            if open {
+                parts.expanded.remove(&node);
+            } else {
+                parts.expanded.insert(node);
+            }
+            toggled = true;
+        }
+    }
+    // The icon: an assembly or a part, outlined when hidden.
+    let icon = Rect::from_min_size(pos2(x + 18.0, rect.top() + 3.0), vec2(16.0, 16.0));
+    paint_icon(&painter, icon, !kids.is_empty(), hidden || outside || empty);
+    let faded = hidden || outside || empty;
+    let colour = if faded { t.text_faint } else { t.text };
+    // The eye, at the end of a hovered, selected or hidden row; the name stops short of it.
+    let eye = Rect::from_min_size(pos2(rect.right() - 22.0, rect.top() + 3.0), vec2(16.0, 16.0));
+    let text_area = Rect::from_min_max(rect.min, pos2(eye.left() - 4.0, rect.bottom()));
+    ui.painter_at(text_area).text(pos2(icon.right() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, &name, theme::regular(13.0), colour);
+    let eye_resp = ui.interact(eye, resp.id.with("eye"), Sense::click());
+    if (resp.hovered() || eye_resp.hovered() || selected || parts.hidden.contains(&node)) && !empty {
+        let tint = if eye_resp.hovered() { t.text } else { t.text_muted };
+        icons::paint(ui, eye, if parts.hidden.contains(&node) { "eye-off" } else { "eye" }, 14.0, tint);
+    }
+    let eye_resp = eye_resp.on_hover_text(if parts.hidden.contains(&node) { tl!("Show") } else { tl!("Hide") });
+    if eye_resp.clicked() && !empty {
+        if !parts.hidden.remove(&node) {
+            parts.hidden.insert(node);
+        }
+        parts.changed();
+    } else if resp.clicked() && !toggled {
+        parts.select(scene, if selected { None } else { Some(node) });
+    }
+    if resp.double_clicked() && !kids.is_empty() {
+        if open {
+            parts.expanded.remove(&node);
+        } else {
+            parts.expanded.insert(node);
+        }
+    }
+    let resp = resp.on_hover_text(&name);
+    resp.context_menu(|ui| {
+        let is_hidden = parts.hidden.contains(&node);
+        if ui.button(if is_hidden { tl!("Show") } else { tl!("Hide") }).clicked() {
+            if is_hidden {
+                parts.hidden.remove(&node);
+            } else {
+                parts.hidden.insert(node);
+            }
+            parts.changed();
+            ui.close();
+        }
+        if parts.isolated == Some(node) {
+            if ui.button(tl!("Exit isolate")).clicked() {
+                parts.isolated = None;
+                parts.changed();
+                ui.close();
+            }
+        } else if ui.button(tl!("Isolate")).clicked() {
+            parts.isolated = Some(node);
+            parts.hidden.retain(|&h| !scene.subtree(node).contains(&h));
+            parts.changed();
+            ui.close();
+        }
+        if ui.button(tl!("Show all")).clicked() {
+            parts.isolated = None;
+            parts.hidden.clear();
+            parts.changed();
+            ui.close();
+        }
+    });
+    if open && depth < MAX_DEPTH {
+        let hidden_here = parent_hidden || parts.hidden.contains(&node);
+        for &k in kids {
+            row(ui, t, scene, parts, k, depth + 1, hidden_here);
+        }
+    }
+}
+
+/// A small cube (a part) or two (an assembly), as CAD trees draw them; only outlined when hidden.
+fn paint_icon(painter: &egui::Painter, r: Rect, assembly: bool, faded: bool) {
+    let cube = |painter: &egui::Painter, c: Pos2, s: f32, top: Color32, left: Color32, right: Color32, line: Color32| {
+        let (h, w) = (s * 0.5, s * 0.866);
+        let up = pos2(c.x, c.y - s);
+        let (tl, tr, mid, bl, br, bottom) =
+            (pos2(c.x - w, c.y - h), pos2(c.x + w, c.y - h), c, pos2(c.x - w, c.y + h), pos2(c.x + w, c.y + h), pos2(c.x, c.y + s));
+        let stroke = Stroke::new(1.0, line);
+        painter.add(Shape::convex_polygon(vec![up, tr, mid, tl], top, stroke));
+        painter.add(Shape::convex_polygon(vec![tl, mid, bottom, bl], left, stroke));
+        painter.add(Shape::convex_polygon(vec![mid, tr, br, bottom], right, stroke));
+    };
+    let (top, left, right, line) = if faded {
+        (Color32::TRANSPARENT, Color32::TRANSPARENT, Color32::TRANSPARENT, Color32::from_gray(150))
+    } else {
+        (
+            Color32::from_rgb(0xFF, 0xE0, 0x7A),
+            Color32::from_rgb(0xF2, 0xB8, 0x2E),
+            Color32::from_rgb(0xC9, 0x8B, 0x10),
+            Color32::from_rgb(0x7A, 0x55, 0x00),
+        )
+    };
+    if assembly {
+        let (blue_top, blue_left, blue_right) = if faded {
+            (Color32::TRANSPARENT, Color32::TRANSPARENT, Color32::TRANSPARENT)
+        } else {
+            (Color32::from_rgb(0x9C, 0xC4, 0xFF), Color32::from_rgb(0x4F, 0x8F, 0xF0), Color32::from_rgb(0x2B, 0x63, 0xC8))
+        };
+        cube(painter, pos2(r.left() + 5.5, r.top() + 10.0), 4.6, blue_top, blue_left, blue_right, line);
+        cube(painter, pos2(r.left() + 10.5, r.top() + 7.0), 4.6, top, left, right, line);
+    } else {
+        cube(painter, r.center(), 6.5, top, left, right, line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view3d_ui::scene::Node;
+
+    /// Assembly "A" holding the configuration "Default", which holds "Sub-1" (with "Part-1" and
+    /// "Part-2") and "Bolt-3"; one mesh per part.
+    fn scene() -> Scene {
+        let node = |name: &str, parent: Option<usize>, children: Vec<usize>, meshes: Vec<usize>| Node { name: name.into(), parent, children, meshes };
+        Scene {
+            nodes: vec![
+                node("A", None, vec![1], vec![]),
+                node("Default", Some(0), vec![2, 5], vec![]),
+                node("Sub-1", Some(1), vec![3, 4], vec![]),
+                node("Part-1", Some(2), vec![], vec![0]),
+                node("Part-2", Some(2), vec![], vec![1]),
+                node("Bolt-3", Some(1), vec![], vec![2]),
+            ],
+            mesh_nodes: vec![Some(3), Some(4), Some(5)],
+            ..Scene::default()
+        }
+    }
+
+    #[test]
+    fn names_read_as_solidworks_writes_them_and_the_configuration_is_looked_through() {
+        assert_eq!(display_name("Bottle Side Guides-2"), "Bottle Side Guides<2>");
+        assert_eq!(display_name("SHCS 10-24 x ALL-12"), "SHCS 10-24 x ALL<12>");
+        assert_eq!(display_name("Default"), "Default");
+        assert_eq!(display_name("x-"), "x-");
+        let s = scene();
+        assert_eq!(shown_children(&s, 0), [2, 5]);
+        assert_eq!(shown_children(&s, 2), [3, 4]);
+    }
+
+    #[test]
+    fn hiding_isolating_and_selecting_reach_the_meshes_under_a_node() {
+        let s = scene();
+        let mut parts = Parts::default();
+        assert_eq!(look_of(&s, &parts, None).hidden, [false, false, false]);
+        parts.hidden.insert(2);
+        assert_eq!(look_of(&s, &parts, None).hidden, [true, true, false]);
+        parts.hidden.clear();
+        parts.isolated = Some(4);
+        assert_eq!(look_of(&s, &parts, None).hidden, [true, false, true]);
+        parts.isolated = None;
+        parts.select(&s, Some(2));
+        assert_eq!(look_of(&s, &parts, None).highlighted, [true, true, false]);
+        // Selecting opens the rows above it.
+        assert!(parts.expanded.contains(&1) && parts.expanded.contains(&0));
+    }
+
+    #[test]
+    fn a_section_lies_across_the_bounds_along_its_plane() {
+        let state = SectionState { on: true, plane: Plane::Top, at: 0.25, flip: false };
+        assert_eq!(state.section([0.0; 3], [4.0; 3]), Some(Section { normal: [0.0, 1.0, 0.0], offset: 1.0 }));
+        let flipped = SectionState { flip: true, ..state };
+        assert_eq!(flipped.section([0.0; 3], [4.0; 3]), Some(Section { normal: [-0.0, -1.0, -0.0], offset: -1.0 }));
+        assert_eq!(SectionState::default().section([0.0; 3], [4.0; 3]), None);
+    }
+}

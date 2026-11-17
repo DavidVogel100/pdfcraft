@@ -26,6 +26,9 @@ pdfcraft-cos = { workspace = true }
 pdfcraft-content = { workspace = true }
 pdfcraft-ocr = { workspace = true }
 pdfcraft-render = { workspace = true }
+# 3D models on the page: the PRC reader, and the renderer that draws, cuts and picks them.
+craft-prc = { workspace = true }
+pdfcraft-prc-render = { workspace = true }
 pdfcraft-model = { workspace = true }
 pdfcraft-platform = { workspace = true }
 egui = { workspace = true, features = ["bytemuck", "default_fonts", "monochrome_emoji_fonts"] }

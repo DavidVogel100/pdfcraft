@@ -60,6 +60,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     RightPanel::Tags => ("Tags", None),
                     RightPanel::Search => ("Search", None),
                     RightPanel::Compare => ("Compare", compare.as_ref().filter(|c| c.new == id).map(|c| c.result.changes.len())),
+                    RightPanel::Model3d => ("Model Tree", None),
                 };
                 // Comments count like Acrobat (no replies); the replies go in small text below.
                 let replies = if panel == RightPanel::Comments { crate::comments_panel::reply_count(info) } else { 0 };
@@ -189,7 +190,11 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     let enabled = !modal && view.panel_drag.is_none();
                     thumbnail_size(ui, &t, view, enabled);
                 }
+                if panel == RightPanel::Model3d {
+                    crate::view3d_ui::section_controls(ui, &t, &mut view.view3d);
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
+                    RightPanel::Model3d => crate::view3d_ui::tree_panel(ui, &t, info, &mut view.view3d),
                     RightPanel::Comments => {
                         if let Some(e) = crate::comments_panel::show(ui, &t, doc, view, prefs, comment_allowed, &mut nav) {
                             panel_edit = Some(e);

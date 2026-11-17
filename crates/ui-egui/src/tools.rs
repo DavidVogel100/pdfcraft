@@ -16,3 +16,4 @@ pub(super) mod replace_ui;
 pub(super) mod sign_ui;
 pub(super) mod stamps_ui;
 pub(super) mod tags_ui;
+pub(super) mod view3d_ui;

@@ -39,6 +39,12 @@ impl PdfCraftApp {
                 N::Attachments => self.right = Some(RightPanel::Attachments),
                 N::Layers => self.right = Some(RightPanel::Layers),
             }
+            // A document with a 3D model that asks for no panel opens on its Model Tree, as a
+            // CAD program shows its feature tree.
+            let has_models = self.session.get(self.views[index].id).is_some_and(|d| !d.info.annots_3d.is_empty());
+            if has_models && matches!(navigation, N::PageOnly) {
+                self.right = Some(RightPanel::Model3d);
+            }
         }
         let view = &mut self.views[index];
         if !self.always_default_view {

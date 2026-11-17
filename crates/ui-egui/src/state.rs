@@ -52,6 +52,8 @@ pub enum RightPanel {
     Search,
     /// Compare files: the differences.
     Compare,
+    /// 3D models: the assembly's parts as a CAD feature tree, and the section view.
+    Model3d,
 }
 
 /// Quick-action bar tools (the vertical floating strip).

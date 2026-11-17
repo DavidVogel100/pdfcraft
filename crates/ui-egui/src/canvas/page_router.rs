@@ -43,6 +43,8 @@ pub(crate) enum Owner {
     Added { index: usize, corner: Option<(bool, bool)> },
     /// Enhance ▸ Camera image: a corner of the quadrilateral (0 left top, then clockwise).
     CameraCorner { corner: usize },
+    /// A 3D model shown on the page, by its annotation's index in the page's `/Annots`.
+    Model3d { index: usize },
 }
 
 /// The part of a picture a hit is on.

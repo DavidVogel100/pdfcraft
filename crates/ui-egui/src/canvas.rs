@@ -671,6 +671,8 @@ pub struct DocView {
     /// Edit text: the lines per page (with the document generation they were read at), and the
     /// line being edited.
     pub(crate) edit_lines: HashMap<usize, (u64, Vec<pdfcraft_engine::TextBlock>)>,
+    /// The document's 3D models as shown on its pages (`view3d_ui`).
+    pub(crate) view3d: crate::view3d_ui::View3d,
     /// Edit text: a click on grouped artwork with text queued [`Edit::PrepareText`] for its page:
     /// the page and the point clicked (user space), whose paragraph opens once the page is
     /// prepared, so one click on grouped text starts editing it.
@@ -1137,6 +1139,7 @@ impl DocView {
             organize_range: Default::default(),
             pending_edit: None,
             edit_lines: HashMap::new(),
+            view3d: Default::default(),
             grouped_text_click: None,
             line_editor: None,
             applied_editor: None,
@@ -3307,6 +3310,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     anchor_zoom_change(view, avail.size(), old_zoom);
 
     // Pinch / ctrl+scroll zoom, anchored on the current page.
+    // The wheel over a 3D model zooms the model, not the pages.
+    crate::view3d_ui::take_wheel(ui, &mut view.view3d);
     let zoom_delta = crate::motion::zoom_delta(ui.ctx());
     // Exclude the previous frame's scrollbar tracks from gesture activation.
     let navigation_rect = if view.viewport_screen.is_positive() { avail.intersect(view.viewport_screen) } else { avail };
