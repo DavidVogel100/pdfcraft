@@ -516,3 +516,15 @@ fn a_point_projects_to_the_pixel_it_is_drawn_at() {
     let behind = Camera { eye: [0.0, 0.0, 10.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 30.0 } };
     assert_eq!(behind.project([0.0, 0.0, 20.0], 40, 40), None);
 }
+
+#[test]
+fn unprojecting_a_pixel_at_a_depth_projects_back_to_it() {
+    for camera in
+        [ortho(4.0), Camera { eye: [0.0, 0.0, 10.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 30.0 } }]
+    {
+        let p = camera.unproject(31.5, 9.25, 40, 40, 7.0).unwrap();
+        let [x, y] = camera.project(p, 40, 40).unwrap();
+        assert!((x - 31.5).abs() < 1e-9 && (y - 9.25).abs() < 1e-9, "{x} {y}");
+        assert!((p[2] - 3.0).abs() < 1e-9, "7 units ahead of the eye at z = 10: {p:?}");
+    }
+}

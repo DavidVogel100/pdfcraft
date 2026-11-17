@@ -141,7 +141,9 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
     } else {
         tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset")
     };
-    Some(Hit { tip: Some(tip.into()), ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, egui::CursorIcon::Grab) })
+    // Measuring wants a precise point: a thin crosshair, not a hand.
+    let icon = if view.measuring { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grab };
+    Some(Hit { tip: Some(tip.into()), ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, icon) })
 }
 
 /// A press the model holds: drags turn or move it, a click picks a part, a double-click resets
@@ -332,8 +334,19 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             [byte(c[0]), byte(c[1]), byte(c[2]), 255]
         });
         // The wheel over this model zooms it (up: closer).
-        if view.wheel != 0.0 && pointer.is_some_and(|p| r.contains(p)) {
-            scene::zoom(&mut camera, f64::from(-view.wheel * 0.002).exp());
+        // The wheel over this model zooms it (up: closer), towards what is under the pointer: the
+        // model's surface there, else the point level with the middle of the view.
+        if let Some(p) = pointer.filter(|p| view.wheel != 0.0 && r.contains(*p)) {
+            let about = m.frame.as_ref().and_then(|f| {
+                let (w, h) = (f.image.width, f.image.height);
+                let x = f64::from((p.x - r.left()) / r.width().max(1.0)) * f64::from(w);
+                let y = f64::from((p.y - r.top()) / r.height().max(1.0)) * f64::from(h);
+                // Inside the picture, so the casts are exact.
+                let on_model = (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, &camera)).flatten();
+                on_model.or_else(|| camera.unproject(x, y, w, h, scene::depth_of_target(&camera)))
+            });
+            let about = about.unwrap_or(camera.target);
+            scene::zoom_at(&mut camera, about, f64::from(-view.wheel * 0.002).exp());
             m.camera = Some(camera);
             m.moving_until = now + SETTLE;
             view.wheel = 0.0;

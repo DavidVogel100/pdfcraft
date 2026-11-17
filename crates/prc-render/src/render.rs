@@ -280,6 +280,26 @@ impl Camera {
         (at[0].is_finite() && at[1].is_finite()).then_some([at[0], at[1]])
     }
 
+    /// The world point at pixel (`x`, `y`) of a `width` × `height` picture this camera draws,
+    /// `depth` model units ahead of the eye along the view: the inverse of [`Camera::project`]
+    /// for a point at that depth. `None` when the camera cannot form a view.
+    #[must_use]
+    pub fn unproject(&self, x: f64, y: f64, width: u32, height: u32, depth: f64) -> Option<[f64; 3]> {
+        let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+        let [right, up, forward] = self.basis().ok()?;
+        let (nx, ny) = (x / w * 2.0 - 1.0, 1.0 - y / h * 2.0);
+        let aspect = w / h;
+        let (vx, vy) = match self.projection {
+            Projection::Perspective { fov_y } => {
+                let focal = 1.0 / (fov_y.to_radians() / 2.0).tan();
+                (nx * depth * aspect / focal, ny * depth / focal)
+            }
+            Projection::Orthographic { height } => (nx * height / 2.0 * aspect, ny * height / 2.0),
+        };
+        let p = [0, 1, 2].map(|k| at(self.eye, k) + at(right, k) * vx + at(up, k) * vy + at(forward, k) * depth);
+        p.iter().all(|c| c.is_finite()).then_some(p)
+    }
+
     /// Right, up and forward unit vectors.
     pub(crate) fn basis(&self) -> Result<[[f64; 3]; 3], RenderError> {
         let forward = normalize(sub(self.target, self.eye)).ok_or(RenderError::Camera("the eye and the target coincide"))?;

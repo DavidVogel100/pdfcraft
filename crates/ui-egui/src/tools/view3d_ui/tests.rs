@@ -301,3 +301,63 @@ fn view3d_pictures() {
     let v = &h.state().views[0].view3d;
     assert!(v.models.values().all(|m| matches!(m.load, Load::Ready(_))));
 }
+
+/// On a real file: after a wheel zoom, a drag started on the model turns it about the point
+/// pressed. `VIEW3D_PDF` names the file. `cargo test -p pdfcraft-ui-egui --lib view3d_real_turn -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_real_turn() {
+    let Some(pdf) = std::env::var_os("VIEW3D_PDF") else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    let mut centre = None;
+    for _ in 0..6000 {
+        h.run_steps(2);
+        let v = &h.state().views[0];
+        if let (Some(r), Some(_)) = (v.page_screen_rect(0), v.view3d.camera(0, 0)) {
+            centre = Some(r.center());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let centre = centre.unwrap();
+    h.run_steps(30);
+    let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+    eprintln!("whole page {} screen {:?} page {:?}", m.whole_page, m.screen, h.state().views[0].page_screen_rect(0));
+    // Zoom in over the model with the wheel.
+    for _ in 0..10 {
+        h.event(egui::Event::PointerMoved(centre));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(30);
+    // Find a point on the model a little off the middle.
+    let mut at = None;
+    'find: for dy in [-40.0, 0.0, 40.0, 80.0] {
+        for dx in [-60.0, -30.0, 30.0, 60.0] {
+            let p = centre + egui::vec2(dx, dy);
+            if surface_point(&h, p).is_some() {
+                at = Some(p);
+                break 'find;
+            }
+        }
+    }
+    let at = at.expect("a point on the model");
+    let pressed = surface_point(&h, at).unwrap();
+    let before = camera(&h);
+    drag(&mut h, at, egui::vec2(50.0, 20.0), egui::Modifiers::NONE);
+    let after = camera(&h);
+    eprintln!("about {:?}", h.state().views[0].view3d.models.get(&(0, 0)).unwrap().turn_about);
+    eprintln!("pressed {pressed:?}\n before {:?}\n after {:?}", seen_from(&before, pressed), seen_from(&after, pressed));
+    assert!(close(seen_from(&after, pressed), seen_from(&before, pressed)), "the point pressed stays put");
+}

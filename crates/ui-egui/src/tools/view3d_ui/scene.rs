@@ -144,20 +144,33 @@ pub(crate) fn pan(camera: &mut Camera, dx: f64, dy: f64, height: f64) {
     camera.target = add(camera.target, shift);
 }
 
-/// Move closer (`factor` below 1) or away; an orthographic view shows less or more.
-pub(crate) fn zoom(camera: &mut Camera, factor: f64) {
-    if !(factor.is_finite() && factor > 0.0) {
+/// Zoom by `factor` (below 1: closer) towards the world point `about`, which stays where it is
+/// on the picture: everything moves towards it, or away, along the view.
+pub(crate) fn zoom_at(camera: &mut Camera, about: [f64; 3], factor: f64) {
+    if !(factor.is_finite() && factor > 0.0) || !about.iter().all(|c| c.is_finite()) {
         return;
     }
+    let target = add(about, scale(sub(camera.target, about), factor));
     match &mut camera.projection {
         Projection::Perspective { .. } => {
-            let back = scale(sub(camera.eye, camera.target), factor);
-            if dot(back, back) > 1e-24 {
-                camera.eye = add(camera.target, back);
+            let eye = add(about, scale(sub(camera.eye, about), factor));
+            if dot(sub(target, eye), sub(target, eye)) > 1e-24 {
+                (camera.eye, camera.target) = (eye, target);
             }
         }
-        Projection::Orthographic { height } => *height = (*height * factor).max(1e-9),
+        Projection::Orthographic { height } => {
+            // The view keeps its distance; it slides across and shows less.
+            camera.eye = add(camera.eye, sub(target, camera.target));
+            camera.target = target;
+            *height = (*height * factor).max(1e-9);
+        }
     }
+}
+
+/// How far ahead of the eye the target lies, along the view.
+pub(crate) fn depth_of_target(camera: &Camera) -> f64 {
+    let d = sub(camera.target, camera.eye);
+    dot(d, d).sqrt()
 }
 
 /// Model units from the bottom of the view to the top, at the target.
@@ -243,14 +256,15 @@ mod tests {
         pan(&mut c, 100.0, 0.0, 100.0);
         assert!(c.target[0] < 0.0 && (c.eye[0] - c.target[0]).abs() < 1e-9, "the model follows the pointer right");
         let target = c.target;
-        zoom(&mut c, 0.5);
+        zoom_at(&mut c, target, 0.5);
         assert!(close(c.target, target));
         let d = sub(c.eye, c.target);
         assert!((dot(d, d).sqrt() - 5.0).abs() < 1e-9);
-        zoom(&mut c, f64::NAN);
+        zoom_at(&mut c, target, f64::NAN);
         assert!((dot(sub(c.eye, c.target), sub(c.eye, c.target)).sqrt() - 5.0).abs() < 1e-9);
         let mut o = Camera { projection: Projection::Orthographic { height: 4.0 }, ..camera() };
-        zoom(&mut o, 2.0);
+        let target = o.target;
+        zoom_at(&mut o, target, 2.0);
         assert_eq!(o.projection, Projection::Orthographic { height: 8.0 });
     }
 
@@ -282,6 +296,18 @@ mod tests {
         let mut o = Camera { projection: Projection::Orthographic { height: 4.0 }, ..camera() };
         widen(&mut o, 1.5);
         assert_eq!(o.projection, Projection::Orthographic { height: 6.0 });
+    }
+
+    #[test]
+    fn zooming_towards_a_point_keeps_it_where_it_is_on_the_picture() {
+        for projection in [Projection::Perspective { fov_y: 30.0 }, Projection::Orthographic { height: 4.0 }] {
+            let mut c = Camera { projection, ..camera() };
+            let about = [1.0, 2.0, 0.7];
+            let before = c.project(about, 400, 300).unwrap();
+            zoom_at(&mut c, about, 0.5);
+            let after = c.project(about, 400, 300).unwrap();
+            assert!((before[0] - after[0]).abs() < 1e-6 && (before[1] - after[1]).abs() < 1e-6, "{before:?} {after:?}");
+        }
     }
 
     #[test]
