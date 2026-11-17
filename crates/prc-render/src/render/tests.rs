@@ -475,8 +475,12 @@ fn a_section_cuts_away_what_lies_past_it_and_shows_insides_darker() {
 #[test]
 fn several_cores_pick_the_same_meshes_as_one() {
     let meshes: Vec<WorldMesh> = (0..12).map(|k| quad(f64::from(k) * 0.1, 0.3 + f64::from(k) * 0.1, 0.05)).collect();
-    let look =
-        Look { hidden: vec![false, true], highlighted: vec![false, false, true], section: Some(Section { normal: [1.0, 0.2, 0.0], offset: 0.4 }) };
+    let look = Look {
+        hidden: vec![false, true],
+        highlighted: vec![false, false, true],
+        section: Some(Section { normal: [1.0, 0.2, 0.0], offset: 0.4 }),
+        outlines: Some(meshes.iter().map(|m| crate::outline_edges(&m.mesh)).collect()),
+    };
     let one = render_in(&meshes, &ortho(4.0), &small(), &look, Some(1)).unwrap();
     for workers in [2, 5] {
         assert_eq!(render_in(&meshes, &ortho(4.0), &small(), &look, Some(workers)).unwrap(), one);
@@ -527,4 +531,24 @@ fn unprojecting_a_pixel_at_a_depth_projects_back_to_it() {
         assert!((x - 31.5).abs() < 1e-9 && (y - 9.25).abs() < 1e-9, "{x} {y}");
         assert!((p[2] - 3.0).abs() < 1e-9, "7 units ahead of the eye at z = 10: {p:?}");
     }
+}
+
+#[test]
+fn a_parts_edges_are_drawn_where_nothing_hides_them() {
+    // A near small square in front of a far large one; each square's border is an edge.
+    let meshes = [quad(1.0, 0.5, 0.0), quad(0.0, 1.5, 0.0)];
+    let look = Look { outlines: Some(meshes.iter().map(|m| crate::outline_edges(&m.mesh)).collect()), ..Look::default() };
+    let plain = render_look(&meshes, &ortho(4.0), &small(), &Look::default()).unwrap();
+    let lined = render_look(&meshes, &ortho(4.0), &small(), &look).unwrap();
+    let inked = |f: &Frame| (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).filter(|&(x, y)| pixel(&f.image, x, y) == OUTLINE).count();
+    assert_eq!(inked(&plain), 0);
+    assert!(inked(&lined) > 100, "both borders drawn: {}", inked(&lined));
+    // The middle of the near square has no edge; its border does.
+    assert_ne!(pixel(&lined.image, 20, 20), OUTLINE);
+    assert_eq!(pixel(&lined.image, 15, 20), OUTLINE, "the near square's left edge, at x = -0.5");
+    // The far square's diagonal is inside its face, and its border is out at x = -1.5.
+    assert_eq!(pixel(&lined.image, 5, 20), OUTLINE);
+    // Hidden: hide the near square and draw only the far one's edges where the near one was.
+    let behind = Look { hidden: vec![false, false], ..look.clone() };
+    assert_eq!(render_look(&meshes, &ortho(4.0), &small(), &behind).unwrap(), lined);
 }

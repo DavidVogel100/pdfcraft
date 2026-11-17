@@ -121,16 +121,21 @@ pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &C
             painter.circle_filled(b, 2.5, INK);
         }
         if let Some(at) = to_screen(label_at) {
-            label(painter, at + vec2(8.0, -8.0), &text(reading, units));
+            label(painter, r, at + vec2(8.0, -8.0), &text(reading, units));
         }
     }
 }
 
-/// A reading's value in a small card beside where it is measured.
-fn label(painter: &egui::Painter, at: Pos2, text: &str) {
+/// A reading's value in a small card beside where it is measured, kept inside the view `area`
+/// (moved in from an edge it would run past).
+fn label(painter: &egui::Painter, area: Rect, at: Pos2, text: &str) {
     let galley = painter.layout_no_wrap(text.to_owned(), crate::theme::semibold(12.0), Color32::WHITE);
-    let rect = Rect::from_min_size(at, galley.size()).expand(4.0);
-    painter.rect_filled(rect, CornerRadius::same(3), INK);
+    let size = galley.size();
+    let inner = area.shrink(4.0);
+    let x = at.x.min(inner.right() - size.x).max(inner.left());
+    let y = at.y.min(inner.bottom() - size.y).max(inner.top());
+    let at = pos2(x, y);
+    painter.rect_filled(Rect::from_min_size(at, size).expand(4.0), CornerRadius::same(3), INK);
     painter.galley(at, galley, Color32::WHITE);
 }
 

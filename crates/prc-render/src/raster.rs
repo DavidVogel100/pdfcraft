@@ -303,6 +303,55 @@ impl Target<'_> {
     }
 }
 
+/// The pixels of the line from `a` to `b` (screen corners) that no nearer surface hides, by
+/// index into an image `width` × `height` whose depth keys are `depth`; pushed onto `out`. A
+/// line lies on the surfaces it bounds, so it passes where it is as near as they are within a
+/// small allowance. With `sectioned`, pixels past the section plane are left out.
+pub(crate) fn line_pixels(
+    a: Corner,
+    b: Corner,
+    (width, height): (u32, u32),
+    depth: &[f64],
+    perspective: bool,
+    sectioned: bool,
+    out: &mut Vec<usize>,
+) {
+    // How much nearer than the line a surface must be to hide it, as a share of its key.
+    const ALLOWANCE: f64 = 5e-4;
+    let (dx, dy) = (at(b.at, 0) - at(a.at, 0), at(b.at, 1) - at(a.at, 1));
+    let steps = dx.abs().max(dy.abs()).ceil();
+    if !steps.is_finite() || steps > f64::from(width.max(height)) * 4.0 {
+        return;
+    }
+    // Whole steps of at most a pixel, so the line is unbroken.
+    let n = steps.max(1.0) as u32;
+    for k in 0..=n {
+        let t = f64::from(k) / f64::from(n);
+        let (x, y) = (at(a.at, 0) + dx * t, at(a.at, 1) + dy * t);
+        if !(x >= 0.0 && y >= 0.0 && x < f64::from(width) && y < f64::from(height)) {
+            continue;
+        }
+        let key = at(a.at, 2) + (at(b.at, 2) - at(a.at, 2)) * t;
+        if sectioned {
+            // Perspective-correct, as across a triangle.
+            let past = if perspective && key > 0.0 {
+                (a.cut * at(a.at, 2) * (1.0 - t) + b.cut * at(b.at, 2) * t) / key
+            } else {
+                a.cut + (b.cut - a.cut) * t
+            };
+            if past > 0.0 {
+                continue;
+            }
+        }
+        // Within the image, so the casts are exact.
+        let Some(i) = pixel_index(width, x as u32, y as u32) else { continue };
+        let Some(&d) = depth.get(i) else { continue };
+        if key >= d - d.abs() * ALLOWANCE {
+            out.push(i);
+        }
+    }
+}
+
 /// Pixel `x, y`'s index in an image `width` wide; `None` on overflow.
 pub(crate) fn pixel_index(width: u32, x: u32, y: u32) -> Option<usize> {
     usize::try_from(y).ok()?.checked_mul(usize::try_from(width).ok()?)?.checked_add(usize::try_from(x).ok()?)

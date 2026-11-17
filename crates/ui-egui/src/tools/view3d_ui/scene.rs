@@ -23,6 +23,8 @@ pub(crate) struct Scene {
     /// Per mesh, the node it belongs to.
     pub(crate) mesh_nodes: Vec<Option<usize>>,
     pub(crate) bounds: Option<Bounds>,
+    /// Per mesh, the edges drawn over it: where its faces meet.
+    pub(crate) outlines: std::sync::Arc<[Vec<[u32; 2]>]>,
     /// The model's unit, when the file says what it is.
     pub(crate) units: Option<craft_prc::ModelUnits>,
 }
@@ -58,7 +60,8 @@ impl Scene {
         }
         let bounds = Bounds::of(&meshes);
         let units = prc.units().ok().flatten();
-        Ok(Scene { meshes, nodes, mesh_nodes, bounds, units })
+        let outlines = meshes.iter().map(|m| pdfcraft_prc_render::outline_edges(&m.mesh)).collect();
+        Ok(Scene { meshes, nodes, mesh_nodes, bounds, outlines, units })
     }
 
     /// The nodes with no parent.

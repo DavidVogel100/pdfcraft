@@ -13,13 +13,15 @@
 mod assemble;
 pub mod measure;
 pub mod nav;
+mod outline;
 mod raster;
 mod render;
 pub mod shapes;
 mod vec3;
 
 pub use assemble::{MAX_ASSEMBLED_TRIANGLES, MAX_ASSEMBLED_VERTICES, WorldMesh, assemble, place};
+pub use outline::outline_edges;
 pub use render::{
-    Bounds, Camera, Frame, HIGHLIGHT, Image, Lighting, Look, MAX_RENDER_PIXELS, MAX_RENDER_WORK, Projection, RenderError, RenderOptions, Section,
-    ViewLens, ViewSide, render, render_look,
+    Bounds, Camera, Frame, HIGHLIGHT, Image, Lighting, Look, MAX_RENDER_PIXELS, MAX_RENDER_WORK, OUTLINE, Projection, RenderError, RenderOptions,
+    Section, ViewLens, ViewSide, render, render_look,
 };

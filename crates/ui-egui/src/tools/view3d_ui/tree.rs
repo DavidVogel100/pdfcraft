@@ -126,6 +126,7 @@ pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>) ->
         hidden: scene.mesh_nodes.iter().map(|&node| of(&hidden, node, false) || !of(&inside, node, parts.isolated.is_none())).collect(),
         highlighted: scene.mesh_nodes.iter().map(|&node| of(&picked, node, false)).collect(),
         section,
+        outlines: Some(std::sync::Arc::clone(&scene.outlines)),
     }
 }
 

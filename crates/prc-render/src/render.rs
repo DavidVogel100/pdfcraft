@@ -418,6 +418,9 @@ pub struct Look {
     pub highlighted: Vec<bool>,
     /// What lies past this plane is cut away.
     pub section: Option<Section>,
+    /// Per mesh, the edges drawn over it in [`OUTLINE`] where nothing hides them (as
+    /// [`crate::outline_edges`] finds them): its faces' borders, as CAD programs draw them.
+    pub outlines: Option<std::sync::Arc<[Vec<[u32; 2]>]>>,
 }
 
 impl Look {
@@ -440,6 +443,9 @@ pub struct Section {
     /// Where the plane lies along `normal`, in its units.
     pub offset: f64,
 }
+
+/// The colour of [`Look::outlines`].
+pub const OUTLINE: [u8; 4] = [24, 24, 28, 255];
 
 /// The colour [`Look::highlighted`] meshes are tinted towards.
 pub const HIGHLIGHT: [u8; 3] = [40, 130, 255];
@@ -617,6 +623,34 @@ fn render_in(
         };
         each_in_parallel(&mut pieces, &draw_band)?;
     }
+    // Then the edges, over everything, where nothing nearer hides them: each worker finds the
+    // pixels of a run of them, and those are inked once all have looked.
+    if let Some(outlines) = &look.outlines {
+        let edges: usize = shown().map(|(k, _)| outlines.get(k).map_or(0, Vec::len)).sum();
+        let runs = split(edges, workers(edges.saturating_mul(8), 0));
+        let depth = &out.depth;
+        let find = |run: Range<usize>, found: &mut Vec<usize>| {
+            let mut first = 0;
+            for (k, m) in shown() {
+                let lines = outlines.get(k).map_or(&[][..], Vec::as_slice);
+                let (lo, hi) = (run.start.saturating_sub(first).min(lines.len()), run.end.saturating_sub(first).min(lines.len()));
+                first += lines.len();
+                for &[a, b] in lines.get(lo..hi).unwrap_or(&[]) {
+                    scene.line(&m.mesh, [a, b], (width, height), depth, found);
+                }
+            }
+        };
+        let mut found: Vec<(Range<usize>, Vec<usize>)> = runs.into_iter().map(|r| (r, Vec::new())).collect();
+        each_in_parallel(&mut found, &|(run, pixels): &mut (Range<usize>, Vec<usize>)| {
+            find(run.clone(), pixels);
+            Ok(())
+        })?;
+        for i in found.iter().flat_map(|(_, p)| p) {
+            if let Some(px) = i.checked_mul(4).and_then(|s| out.rgba.get_mut(s..s.checked_add(4)?)) {
+                px.copy_from_slice(&OUTLINE);
+            }
+        }
+    }
     Ok(Frame { image: Image { width, height, rgba: out.rgba }, ids: out.ids, depth: out.depth })
 }
 
@@ -730,6 +764,40 @@ impl Scene {
             View::Orthographic { .. } => Some(scale(at3(&self.basis, 2), -1.0)),
         };
         [0.3 + 0.7 * towards.map_or(1.0, |v| dot(n, v).abs().min(1.0)); 3]
+    }
+
+    /// The pixels of `mesh`'s edge between corners `a` and `b` that nothing nearer in `depth`
+    /// hides, in a picture `size` big; pushed onto `out`.
+    fn line(&self, mesh: &TriangleMesh, [a, b]: [u32; 2], size: (u32, u32), depth: &[f64], out: &mut Vec<usize>) {
+        let corner = |i: u32| usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied()).filter(|p| p.iter().all(|c| c.is_finite()));
+        let (Some(pa), Some(pb)) = (corner(a), corner(b)) else { return };
+        let [right, up, forward] = self.basis;
+        let past = |p: [f64; 3]| self.section.map_or(0.0, |s| dot(s.normal, p) - s.offset);
+        let view = |p: [f64; 3]| -> ViewCorner {
+            let d = sub(p, self.eye);
+            [dot(d, right), dot(d, up), dot(d, forward), 0.0, 0.0, 0.0, past(p)]
+        };
+        let (mut va, mut vb) = (view(pa), view(pb));
+        // A perspective line is cut where it passes the near plane.
+        if let View::Perspective { near, .. } = self.view {
+            let z = |v: &ViewCorner| v.get(2).copied().unwrap_or(0.0);
+            match (z(&va) >= near, z(&vb) >= near) {
+                (false, false) => return,
+                (true, true) => {}
+                (a_in, _) => {
+                    let (inside, outside) = if a_in { (va, vb) } else { (vb, va) };
+                    let t = (near - z(&inside)) / (z(&outside) - z(&inside));
+                    let mut cut = inside;
+                    for (c, o) in cut.iter_mut().zip(outside) {
+                        *c += t * (o - *c);
+                    }
+                    if a_in { vb = cut } else { va = cut }
+                }
+            }
+        }
+        let perspective = matches!(self.view, View::Perspective { .. });
+        let (sa, sb) = (self.view.project(va, size.0, size.1), self.view.project(vb, size.0, size.1));
+        crate::raster::line_pixels(sa, sb, size, depth, perspective, self.section.is_some(), out);
     }
 
     /// Draw triangle `t` of `mesh` into `target` in straight-RGBA `colour`; refused once the
