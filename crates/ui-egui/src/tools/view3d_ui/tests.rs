@@ -89,6 +89,31 @@ fn close(a: [f64; 3], b: [f64; 3]) -> bool {
     (0..3).all(|k| (a[k] - b[k]).abs() < 1e-6 * size)
 }
 
+/// The model's surface under screen point `p`, from the frame last drawn.
+fn surface_point(h: &Harness, p: egui::Pos2) -> Option<[f64; 3]> {
+    let m = h.state().views[0].view3d.models.get(&(0, 0))?;
+    let (r, f, c) = (m.screen?, m.frame.as_ref()?, m.camera?);
+    let x = (p.x - r.left()) / r.width() * f.image.width as f32;
+    let y = (p.y - r.top()) / r.height() * f.image.height as f32;
+    f.point_at(x as u32, y as u32, &c)
+}
+
+/// Where `p` lies from `c`'s eye: right, up and ahead.
+fn seen_from(c: &Camera, p: [f64; 3]) -> [f64; 3] {
+    let d = [0, 1, 2].map(|k| p[k] - c.eye[k]);
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let ahead = direction(c);
+    let len = dot(ahead, ahead).sqrt();
+    let ahead = ahead.map(|v| v / len);
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    // The camera's `up` need not be square to the view; the picture's own up is.
+    let right = cross(ahead, c.up);
+    let len = dot(right, right).sqrt();
+    let right = right.map(|v| v / len);
+    let up = cross(right, ahead);
+    [dot(d, right), dot(d, up), dot(d, ahead)]
+}
+
 fn camera(h: &Harness) -> Camera {
     h.state().views[0].view3d.camera(0, 0).unwrap()
 }
@@ -127,10 +152,15 @@ fn a_drag_turns_the_model_a_shift_drag_moves_it_and_a_double_click_goes_back() {
     assert!(!close(moved.target, before.target), "Shift+drag moves the model: {:?} -> {:?}", before.target, moved.target);
     assert!(close(direction(&moved), direction(&before)), "Shift+drag doesn't turn it");
 
+    // A plain drag turns it about the point of the model under the press, which stays where it
+    // is on the picture: the same distance right, up and ahead of the eye.
+    let pressed = surface_point(&h, at);
     drag(&mut h, at, egui::vec2(60.0, 0.0), egui::Modifiers::NONE);
     let turned = camera(&h);
-    assert!(close(turned.target, moved.target), "a plain drag doesn't move it");
     assert!(!close(direction(&turned), direction(&moved)), "a plain drag turns it");
+    let about = pressed.unwrap_or(moved.target);
+    assert!(close(seen_from(&turned, about), seen_from(&moved, about)), "the point turned about stays put on the picture");
+    assert!(pressed.is_some(), "the press was on the model");
 
     h.event(egui::Event::PointerMoved(at));
     h.run_steps(1);

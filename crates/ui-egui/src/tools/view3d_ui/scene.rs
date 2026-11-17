@@ -89,21 +89,43 @@ pub(crate) fn nearest_axis(v: [f64; 3]) -> [f64; 3] {
     axis
 }
 
-/// Turn the camera about its target as a turntable does: `dx` round `pivot` and `dy` over the
-/// top, both in pixels of a picture `height` high (its height is half a turn). Stops short of
-/// looking straight along the pivot, where the view would flip.
-pub(crate) fn turn(camera: &mut Camera, pivot: [f64; 3], dx: f64, dy: f64, height: f64) {
+/// Turn the camera as a turntable does, about the world point `about` (the model stays put
+/// there on the picture): `dx` round the `pivot` axis and `dy` over the top, both in pixels of a
+/// picture `height` high (its height is half a turn). Stops short of looking straight along the
+/// pivot, where the view would flip.
+pub(crate) fn turn(camera: &mut Camera, pivot: [f64; 3], about: [f64; 3], dx: f64, dy: f64, height: f64) {
     let k = std::f64::consts::PI / height.max(1.0);
     let (yaw, pitch) = (-dx * k, -dy * k);
-    let back = sub(camera.eye, camera.target);
-    let (back, up) = (rotate(back, pivot, yaw), rotate(camera.up, pivot, yaw));
+    // Eye and target, each relative to the point turned about, turned together.
+    let (eye, target) = (sub(camera.eye, about), sub(camera.target, about));
+    let (eye, target, up) = (rotate(eye, pivot, yaw), rotate(target, pivot, yaw), rotate(camera.up, pivot, yaw));
+    let back = sub(eye, target);
     let Some(right) = normalize(cross(up, back)) else { return };
-    let tilted = rotate(back, right, pitch);
-    let back = if dot(rotate(up, right, pitch), pivot) > 0.02 { tilted } else { back };
-    camera.eye = add(camera.target, back);
+    let (eye, target) =
+        if dot(rotate(up, right, pitch), pivot) > 0.02 { (rotate(eye, right, pitch), rotate(target, right, pitch)) } else { (eye, target) };
+    camera.eye = add(about, eye);
+    camera.target = add(about, target);
     // Kept square to the view, so the renderer's basis always forms.
+    let back = sub(eye, target);
     if let Some(up) = normalize(cross(normalize(back).unwrap_or(back), right)) {
         camera.up = up;
+    }
+}
+
+/// Widen the view so a picture `factor` times as tall (and as wide) shows the model at the size
+/// the camera showed it before: the field of view or the orthographic height grows by `factor`.
+pub(crate) fn widen(camera: &mut Camera, factor: f64) {
+    if !(factor.is_finite() && factor > 0.0) {
+        return;
+    }
+    match &mut camera.projection {
+        Projection::Perspective { fov_y } => {
+            let wider = 2.0 * ((fov_y.to_radians() / 2.0).tan() * factor).atan().to_degrees();
+            if wider > 0.0 && wider < 179.0 {
+                *fov_y = wider;
+            }
+        }
+        Projection::Orthographic { height } => *height *= factor,
     }
 }
 
@@ -194,7 +216,8 @@ mod tests {
     fn a_drag_across_turns_round_the_pivot_and_keeps_the_distance() {
         let mut c = camera();
         // Half the picture's height across is a quarter turn.
-        turn(&mut c, [0.0, 0.0, 1.0], 100.0, 0.0, 200.0);
+        let target = c.target;
+        turn(&mut c, [0.0, 0.0, 1.0], target, 100.0, 0.0, 200.0);
         assert!(close(c.eye, [10.0, 0.0, 0.0]) || close(c.eye, [-10.0, 0.0, 0.0]), "{:?}", c.eye);
         assert!(close(c.up, [0.0, 0.0, 1.0]));
     }
@@ -203,7 +226,8 @@ mod tests {
     fn a_drag_up_and_down_stops_short_of_the_pole() {
         let mut c = camera();
         for _ in 0..20 {
-            turn(&mut c, [0.0, 0.0, 1.0], 0.0, 40.0, 200.0);
+            let target = c.target;
+            turn(&mut c, [0.0, 0.0, 1.0], target, 0.0, 40.0, 200.0);
         }
         assert!(dot(c.up, [0.0, 0.0, 1.0]) > 0.0, "never flipped over: {:?}", c.up);
         let d = sub(c.eye, c.target);
@@ -225,6 +249,36 @@ mod tests {
         let mut o = Camera { projection: Projection::Orthographic { height: 4.0 }, ..camera() };
         zoom(&mut o, 2.0);
         assert_eq!(o.projection, Projection::Orthographic { height: 8.0 });
+    }
+
+    #[test]
+    fn turning_about_a_point_keeps_that_point_where_it_is_on_the_picture() {
+        let mut c = camera();
+        // A point off to the side of the target, which a drag started over.
+        let about = [2.0, 0.0, 1.0];
+        let before = sub(about, c.eye);
+        let (ahead, up) = (normalize(sub(c.target, c.eye)).unwrap(), c.up);
+        let along = |c: &Camera, v: [f64; 3]| {
+            let ahead = normalize(sub(c.target, c.eye)).unwrap();
+            let right = normalize(cross(ahead, c.up)).unwrap();
+            [dot(v, right), dot(v, c.up), dot(v, ahead)]
+        };
+        let seen = along(&Camera { up, ..c }, before);
+        turn(&mut c, [0.0, 0.0, 1.0], about, 30.0, 20.0, 200.0);
+        let after = along(&c, sub(about, c.eye));
+        assert!((0..3).all(|k| (seen[k] - after[k]).abs() < 1e-9), "{seen:?} {after:?}");
+        assert!(!close(normalize(sub(c.target, c.eye)).unwrap(), ahead), "the view turned");
+    }
+
+    #[test]
+    fn widening_keeps_the_model_the_same_size_on_a_taller_picture() {
+        let mut c = camera();
+        widen(&mut c, 2.0);
+        let Projection::Perspective { fov_y } = c.projection else { unreachable!() };
+        assert!(((fov_y.to_radians() / 2.0).tan() - 2.0 * (15f64.to_radians()).tan()).abs() < 1e-12);
+        let mut o = Camera { projection: Projection::Orthographic { height: 4.0 }, ..camera() };
+        widen(&mut o, 1.5);
+        assert_eq!(o.projection, Projection::Orthographic { height: 6.0 });
     }
 
     #[test]

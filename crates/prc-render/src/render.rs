@@ -411,14 +411,17 @@ const HIGHLIGHT_SHARE: f64 = 0.65;
 /// The shade of an inside face seen through a section.
 const INSIDE_SHADE: f64 = 0.55;
 
-/// What [`render_look`] drew: the image, and which mesh each pixel shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`render_look`] drew: the image, which mesh each pixel shows, and how far away.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     /// The picture.
     pub image: Image,
     /// Per pixel, row by row from the top, the index of the mesh drawn there last (a
     /// translucent one over an opaque one counts); [`NO_ID`] where only the background shows.
     ids: Vec<u32>,
+    /// Per pixel, the depth key of the nearest opaque surface ([`Target`]'s), negative infinity
+    /// where there is none.
+    depth: Vec<f64>,
 }
 
 impl Frame {
@@ -430,6 +433,39 @@ impl Frame {
         }
         let i = pixel_index(self.image.width, x, y)?;
         self.ids.get(i).copied().filter(|&id| id != NO_ID).and_then(|id| usize::try_from(id).ok())
+    }
+
+    /// The point on the nearest opaque surface seen at the centre of pixel (`x`, `y`), in world
+    /// coordinates, as `camera` (the one the frame was drawn with) sees it: what a viewer turns
+    /// the model about when a drag starts there. `None` where no opaque surface shows.
+    #[must_use]
+    pub fn point_at(&self, x: u32, y: u32, camera: &Camera) -> Option<[f64; 3]> {
+        if x >= self.image.width || y >= self.image.height {
+            return None;
+        }
+        let key = *self.depth.get(pixel_index(self.image.width, x, y)?)?;
+        if !key.is_finite() {
+            return None;
+        }
+        let (w, h) = (f64::from(self.image.width), f64::from(self.image.height));
+        let [right, up, forward] = camera.basis().ok()?;
+        // The pixel centre in normalised device coordinates, y up.
+        let (nx, ny) = ((f64::from(x) + 0.5) / w * 2.0 - 1.0, 1.0 - (f64::from(y) + 0.5) / h * 2.0);
+        let aspect = w / h;
+        // The inverse of `View::project`.
+        let [vx, vy, vz] = match camera.projection {
+            Projection::Perspective { fov_y } => {
+                let focal = 1.0 / (fov_y.to_radians() / 2.0).tan();
+                let z = 1.0 / key;
+                [nx * z * aspect / focal, ny * z / focal, z]
+            }
+            Projection::Orthographic { height } => {
+                let half = height / 2.0;
+                [nx * half * aspect, ny * half, -key]
+            }
+        };
+        let p = [0, 1, 2].map(|k| at(camera.eye, k) + at(right, k) * vx + at(up, k) * vy + at(forward, k) * vz);
+        p.iter().all(|c| c.is_finite()).then_some(p)
     }
 }
 
@@ -542,7 +578,7 @@ fn render_in(
         };
         each_in_parallel(&mut pieces, &draw_band)?;
     }
-    Ok(Frame { image: Image { width, height, rgba: out.rgba }, ids: out.ids })
+    Ok(Frame { image: Image { width, height, rgba: out.rgba }, ids: out.ids, depth: out.depth })
 }
 
 /// `colour` tinted towards [`HIGHLIGHT`]; alpha kept.

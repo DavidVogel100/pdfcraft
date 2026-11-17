@@ -482,3 +482,22 @@ fn several_cores_pick_the_same_meshes_as_one() {
         assert_eq!(render_in(&meshes, &ortho(4.0), &small(), &look, Some(workers)).unwrap(), one);
     }
 }
+
+#[test]
+fn the_point_under_a_pixel_is_where_the_surface_is_in_the_world() {
+    // A square facing the camera at z = 1, seen orthographically and in perspective.
+    let meshes = [quad(1.0, 1.5, 0.0)];
+    for camera in
+        [ortho(4.0), Camera { eye: [0.0, 0.0, 10.0], target: [0.0; 3], up: [0.0, 1.0, 0.0], projection: Projection::Perspective { fov_y: 30.0 } }]
+    {
+        let frame = render_look(&meshes, &camera, &small(), &Look::default()).unwrap();
+        let p = frame.point_at(20, 20, &camera).unwrap();
+        assert!((p[2] - 1.0).abs() < 1e-9, "on the square's plane: {p:?}");
+        assert!(p[0].abs() < 0.2 && p[1].abs() < 0.2, "near the middle: {p:?}");
+        // Right of the middle is +x, above it +y.
+        let q = frame.point_at(26, 14, &camera).unwrap();
+        assert!(q[0] > p[0] && q[1] > p[1], "{p:?} {q:?}");
+        assert_eq!(frame.point_at(0, 0, &camera), None, "background");
+        assert_eq!(frame.point_at(40, 20, &camera), None, "off the image");
+    }
+}

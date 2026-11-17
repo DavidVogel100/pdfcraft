@@ -67,6 +67,11 @@ struct Model {
     screen: Option<Rect>,
     /// During a drag: whether it moves the model (else it turns it), decided as it starts.
     drag: Option<bool>,
+    /// During a turn: the world point it turns about, the model's surface where it started.
+    turn_about: Option<[f64; 3]>,
+    /// Whether the model is drawn across its whole page, not only in its annotation's box: when
+    /// nothing else is drawn on the page around the box, as CAD programs export a model alone.
+    whole_page: bool,
 }
 
 enum Load {
@@ -120,7 +125,11 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
     if tool != QuickTool::Select {
         return None;
     }
-    let m = info.annots_3d.iter().rev().find(|m| m.page == page && xf.user_rect(info, page, m.rect).contains(p) && view.ready(page, m.index))?;
+    let area = |m: &pdfcraft_render::Annot3d| {
+        let whole = view.models.get(&(page, m.index)).is_some_and(|shown| shown.whole_page);
+        if whole { xf.rect } else { xf.user_rect(info, page, m.rect) }
+    };
+    let m = info.annots_3d.iter().rev().find(|m| m.page == page && area(m).contains(p) && view.ready(page, m.index))?;
     Some(Hit {
         tip: Some(tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset").into()),
         ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, egui::CursorIcon::Grab)
@@ -151,14 +160,28 @@ pub(crate) fn page_input(
     if resp.dragged() {
         let other_button = resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle);
         // Decided as the drag starts; Shift pressed partway through still switches to moving.
+        let starting = m.drag.is_none();
         let moves = *m.drag.get_or_insert(shift || other_button) || shift;
         m.drag = Some(moves);
+        // A turn goes about the model's surface where the press was, as CAD programs turn it;
+        // about the middle of the view when the press was beside the model.
+        if starting {
+            let at = ui.input(|i| i.pointer.press_origin());
+            m.turn_about = at.zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
+                let (w, h) = (f.image.width as f32, f.image.height as f32);
+                let x = (p.x - r.left()) / r.width().max(1.0) * w;
+                let y = (p.y - r.top()) / r.height().max(1.0) * h;
+                // Inside the picture, so the casts are exact.
+                (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, camera)).flatten()
+            });
+        }
         let d = resp.drag_delta();
         let (dx, dy) = (f64::from(d.x), f64::from(d.y));
         if moves {
             scene::pan(camera, dx, dy, height);
         } else {
-            scene::turn(camera, pivot, dx, dy, height);
+            let about = m.turn_about.unwrap_or(camera.target);
+            scene::turn(camera, pivot, about, dx, dy, height);
         }
         m.moving_until = now + SETTLE;
         cursor.claim(Layer::Drag, if moves { egui::CursorIcon::Move } else { egui::CursorIcon::Grabbing });
@@ -231,7 +254,12 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             moving_until: 0.0,
             screen: None,
             drag: None,
+            turn_about: None,
+            whole_page: alone_on_page(doc, info, page, model),
         });
+        // The area the model is drawn in: its box, or its whole page.
+        let box_rect = r;
+        let r = if m.whole_page { xf.rect } else { r };
         if let Load::Pending(rx) = &m.load {
             match rx.try_recv() {
                 Ok(Ok(scene)) => m.load = Load::Ready(Arc::new(scene)),
@@ -264,7 +292,13 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             let saved =
                 model.view.and_then(|v| Camera::from_view(v.camera_to_world, v.center_of_orbit, lens(v.projection), size, bounds.centre()).ok());
             let fitted = || Camera::fit_meshes(&scene.meshes, [-1.0, 1.0, -1.0], [0.0, 0.0, 1.0], true, aspect).ok();
-            if let Some(c) = saved.or_else(fitted) {
+            if let Some(mut c) = saved.or_else(fitted) {
+                // Across the whole page, the model keeps the size and place it has in its box.
+                if m.whole_page && box_rect.height() > 0.0 {
+                    scene::widen(&mut c, f64::from(r.height() / box_rect.height()));
+                    let off = box_rect.center() - r.center();
+                    scene::pan(&mut c, f64::from(off.x), f64::from(off.y), f64::from(r.height()));
+                }
                 m.pivot = scene::nearest_axis(c.up);
                 m.camera = Some(c);
                 m.home = Some(c);
@@ -331,6 +365,22 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         m.screen = Some(r);
         view.rects.push(r);
     }
+}
+
+/// Whether `model` is the only thing on its page: no other annotation or link there, and every
+/// piece of the page's own content inside the model's box (a poster, as CAD programs write one).
+fn alone_on_page(doc: &pdfcraft_engine::Document, info: &DocInfo, page: usize, model: &pdfcraft_render::Annot3d) -> bool {
+    // A little room for a poster's edge drawn on the box's line.
+    const SLACK: f64 = 2.0;
+    let [x0, y0, x1, y1] = model.rect.map(f64::from);
+    let (x0, x1, y0, y1) = (x0.min(x1) - SLACK, x0.max(x1) + SLACK, y0.min(y1) - SLACK, y0.max(y1) + SLACK);
+    let others = info.annots_3d.iter().any(|m| m.page == page && m.index != model.index)
+        || info.annotations.iter().any(|a| a.page == page)
+        || info.links.iter().any(|l| l.page == page);
+    if others {
+        return false;
+    }
+    doc.editable_objects(page).is_ok_and(|objects| objects.iter().all(|o| o.rect[0] >= x0 && o.rect[2] <= x1 && o.rect[1] >= y0 && o.rect[3] <= y1))
 }
 
 /// A PDF 3D view's projection as the renderer's lens.
