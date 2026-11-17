@@ -274,8 +274,8 @@ mod tests {
     fn widening_keeps_the_model_the_same_size_on_a_taller_picture() {
         let mut c = camera();
         widen(&mut c, 2.0);
-        let Projection::Perspective { fov_y } = c.projection else { unreachable!() };
-        assert!(((fov_y.to_radians() / 2.0).tan() - 2.0 * (15f64.to_radians()).tan()).abs() < 1e-12);
+        let doubled = |fov_y: f64| ((fov_y.to_radians() / 2.0).tan() - 2.0 * (15f64.to_radians()).tan()).abs() < 1e-12;
+        assert!(matches!(c.projection, Projection::Perspective { fov_y } if doubled(fov_y)), "{:?}", c.projection);
         let mut o = Camera { projection: Projection::Orthographic { height: 4.0 }, ..camera() };
         widen(&mut o, 1.5);
         assert_eq!(o.projection, Projection::Orthographic { height: 6.0 });

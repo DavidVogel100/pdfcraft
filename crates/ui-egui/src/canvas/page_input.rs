@@ -263,7 +263,7 @@ pub(super) fn page_tool_input(ui: &mut egui::Ui, view: &mut DocView, frame: &mut
     // Comments, every frame: their own presses, a commenting tool's, and a click elsewhere that
     // leaves them unselected. A press nobody holds that another tool took this frame (Prepare's
     // selection rectangle, added content) is not also a commenting tool's, as before.
-    let on_model = crate::view3d_ui::page_input(ui, resp, i, press, &mut view.view3d, &mut view.cursor);
+    let on_model = crate::view3d_ui::page_input(ui, resp, i, press, ptr, &mut view.view3d, &mut view.cursor);
     let taken = on_objects || on_edit_text || on_link || on_content || boxing || on_field || on_model;
     let on_comment = comments::page_input(ui, resp, &pcx, press, taken, view);
     let consumed = taken || on_comment;

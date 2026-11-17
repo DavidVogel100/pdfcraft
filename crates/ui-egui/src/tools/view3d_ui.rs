@@ -143,6 +143,7 @@ pub(crate) fn page_input(
     resp: &egui::Response,
     page: usize,
     press: PagePress,
+    ptr: &crate::page_pointer::PagePointer,
     view: &mut View3d,
     cursor: &mut crate::page_cursor::PageCursor,
 ) -> bool {
@@ -166,8 +167,7 @@ pub(crate) fn page_input(
         // A turn goes about the model's surface where the press was, as CAD programs turn it;
         // about the middle of the view when the press was beside the model.
         if starting {
-            let at = ui.input(|i| i.pointer.press_origin());
-            m.turn_about = at.zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
+            m.turn_about = ptr.origin.zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
                 let (w, h) = (f.image.width as f32, f.image.height as f32);
                 let x = (p.x - r.left()) / r.width().max(1.0) * w;
                 let y = (p.y - r.top()) / r.height().max(1.0) * h;
