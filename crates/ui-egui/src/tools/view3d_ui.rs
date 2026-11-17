@@ -73,6 +73,8 @@ struct Model {
     drag: Option<bool>,
     /// The faces picked to measure, and what they read.
     measure: measure::Measure,
+    /// Where the press the model holds went down (screen), seen on the frame it did.
+    press_at: Option<Pos2>,
     /// During a turn: the world point it turns about, the model's surface where it started.
     turn_about: Option<[f64; 3]>,
     /// Whether the model is drawn across its whole page, not only in its annotation's box: when
@@ -168,6 +170,17 @@ pub(crate) fn page_input(
         i.modifiers.shift || i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, modifiers, .. } if modifiers.shift))
     });
     let pivot = m.pivot;
+    if let Some(at) = ptr.edges.iter().rev().find_map(|e| match e {
+        crate::page_pointer::Edge::Press(p) => Some(*p),
+        crate::page_pointer::Edge::Release(_) => None,
+    }) {
+        m.press_at = Some(at);
+    }
+    // What a turn falls back to: the middle of the model, never a point off the screen.
+    let middle = match &m.load {
+        Load::Ready(scene) => scene.bounds.map(|b| b.centre()),
+        _ => None,
+    };
     let Some(camera) = m.camera.as_mut() else { return true };
     if resp.dragged() {
         let other_button = resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle);
@@ -178,7 +191,7 @@ pub(crate) fn page_input(
         // A turn goes about the model's surface where the press was, as CAD programs turn it;
         // about the middle of the view when the press was beside the model.
         if starting {
-            m.turn_about = ptr.origin.zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
+            m.turn_about = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
                 let (w, h) = (f.image.width as f32, f.image.height as f32);
                 let x = (p.x - r.left()) / r.width().max(1.0) * w;
                 let y = (p.y - r.top()) / r.height().max(1.0) * h;
@@ -191,7 +204,7 @@ pub(crate) fn page_input(
         if moves {
             scene::pan(camera, dx, dy, height);
         } else {
-            let about = m.turn_about.unwrap_or(camera.target);
+            let about = m.turn_about.or(middle).unwrap_or(camera.target);
             scene::turn(camera, pivot, about, dx, dy, height);
         }
         m.moving_until = now + SETTLE;
@@ -275,6 +288,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             screen: None,
             drag: None,
             measure: measure::Measure::default(),
+            press_at: None,
             turn_about: None,
             whole_page: alone_on_page(doc, info, page, model),
         });
