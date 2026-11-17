@@ -11,9 +11,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod assemble;
+pub mod measure;
 pub mod nav;
 mod raster;
 mod render;
+pub mod shapes;
 mod vec3;
 
 pub use assemble::{MAX_ASSEMBLED_TRIANGLES, MAX_ASSEMBLED_VERTICES, WorldMesh, assemble, place};
