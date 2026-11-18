@@ -61,6 +61,7 @@ pub(crate) fn scope_of(edit: &Edit) -> Scope {
         | Edit::PasteComments { .. }
         | Edit::AddCustomStamp { .. }
         | Edit::AddModel3d { .. }
+        | Edit::SetModel3dLayers { .. }
         | Edit::DeleteAnnotation { .. }
         | Edit::SetAnnotationContents { .. }
         | Edit::ReplyToAnnotation { .. }

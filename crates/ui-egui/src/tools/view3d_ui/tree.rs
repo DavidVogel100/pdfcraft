@@ -251,9 +251,26 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
                 }
             });
         }
+        let mut layers = TreeLayers { layers: &m.layers, hidden: &mut m.hidden_layers, open: None };
         for root in scene.roots().collect::<Vec<_>>() {
             parts.expanded.insert(root);
-            row(ui, t, &scene, parts, root, 0, false);
+            row(ui, t, &scene, parts, &mut layers, root, 0, false);
+        }
+        // A layer opened: its part isolated and turned to the layer's view.
+        if let Some((node, k)) = layers.open {
+            parts.selected = Some(node);
+            parts.isolated = Some(node);
+            let under = scene.subtree(node);
+            parts.hidden.retain(|h| !under.contains(h));
+            parts.changed();
+            m.hidden_layers.remove(&k);
+            m.dims_node = Some(node);
+            if view.dimensioning {
+                m.active = Some(k);
+            }
+            if let Some(v) = m.layers.get(k).and_then(|l| l.view) {
+                m.camera = Some(super::dims::frame_of(&scene, node).camera(&v));
+            }
         }
         ui.add_space(8.0);
     }
@@ -267,10 +284,21 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
     }
 }
 
-/// One node's row and, when it is open, the rows under it.
-fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, node: usize, depth: usize, parent_hidden: bool) {
+/// The model's dimension layers as the tree lists them under their parts, and the one opened.
+struct TreeLayers<'a> {
+    layers: &'a [pdfcraft_engine::Layer3d],
+    hidden: &'a mut HashSet<usize>,
+    /// The node and layer clicked.
+    open: Option<(usize, usize)>,
+}
+
+/// One node's row and, when it is open, the rows under it: its part's layers, then its children.
+#[allow(clippy::too_many_arguments)]
+fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, layers: &mut TreeLayers<'_>, node: usize, depth: usize, parent_hidden: bool) {
     let Some(n) = scene.nodes.get(node) else { return };
     let kids = shown_children(scene, node);
+    let part = super::dims::part_name(scene, node);
+    let own: Vec<usize> = (0..layers.layers.len()).filter(|&k| layers.layers.get(k).is_some_and(|l| l.part == part)).collect();
     let open = parts.expanded.contains(&node);
     let hidden = parent_hidden || parts.hidden.contains(&node);
     let outside = parts.isolated.is_some_and(|iso| iso != node && !scene.subtree(iso).contains(&node) && !scene.subtree(node).contains(&iso));
@@ -291,7 +319,7 @@ fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, node: us
     // The expander.
     let arrow = Rect::from_min_size(pos2(x, rect.top() + 3.0), vec2(16.0, 16.0));
     let mut toggled = false;
-    if !kids.is_empty() {
+    if !kids.is_empty() || !own.is_empty() {
         let arrow_resp = ui.interact(arrow, resp.id.with("expand"), Sense::click());
         icons::paint(ui, arrow, if open { "chevron-down" } else { "chevron-right" }, 13.0, t.text_muted);
         if arrow_resp.clicked() {
@@ -312,6 +340,11 @@ fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, node: us
     let eye = Rect::from_min_size(pos2(rect.right() - 22.0, rect.top() + 3.0), vec2(16.0, 16.0));
     let text_area = Rect::from_min_max(rect.min, pos2(eye.left() - 4.0, rect.bottom()));
     ui.painter_at(text_area).text(pos2(icon.right() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, &name, theme::regular(13.0), colour);
+    if !own.is_empty() {
+        // The part has dimensions: a ruler before the eye.
+        let ruler = Rect::from_min_size(pos2(eye.left() - 20.0, rect.top() + 3.0), vec2(16.0, 16.0));
+        icons::paint(ui, ruler, "ruler", 13.0, t.accent_text);
+    }
     let eye_resp = ui.interact(eye, resp.id.with("eye"), Sense::click());
     if (resp.hovered() || eye_resp.hovered() || selected || parts.hidden.contains(&node)) && !empty {
         let tint = if eye_resp.hovered() { t.text } else { t.text_muted };
@@ -365,10 +398,49 @@ fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, node: us
         }
     });
     if open && depth < MAX_DEPTH {
+        for &k in &own {
+            layer_row(ui, t, scene, layers, node, k, depth + 1);
+        }
         let hidden_here = parent_hidden || parts.hidden.contains(&node);
         for &k in kids {
-            row(ui, t, scene, parts, k, depth + 1, hidden_here);
+            row(ui, t, scene, parts, layers, k, depth + 1, hidden_here);
         }
+    }
+}
+
+/// A layer's row under its part: a click opens it, the eye shows or hides it.
+fn layer_row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, layers: &mut TreeLayers<'_>, node: usize, k: usize, depth: usize) {
+    let Some(layer) = layers.layers.get(k) else { return };
+    let copies = super::dims::copies(scene, &layer.part);
+    let mut name = if layer.name.is_empty() { tl!("Dimensions").to_owned() } else { layer.name.clone() };
+    if copies > 1 {
+        name.push_str(&crate::i18n::fmt(tl!(" (shared by {n} copies)"), &[("n", &copies.to_string())]));
+    }
+    let hidden = layers.hidden.contains(&k);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TreeItem, true, &name));
+    let press = theme::Press::track(ui, &resp);
+    press.wash(ui, rect, 4, false);
+    let x = rect.left() + 2.0 + depth.min(MAX_DEPTH) as f32 * INDENT + 18.0;
+    icons::paint(
+        ui,
+        Rect::from_min_size(pos2(x, rect.top() + 3.0), vec2(16.0, 16.0)),
+        "ruler",
+        13.0,
+        if hidden { t.text_faint } else { t.accent_text },
+    );
+    let eye = Rect::from_min_size(pos2(rect.right() - 22.0, rect.top() + 3.0), vec2(16.0, 16.0));
+    let text_area = Rect::from_min_max(rect.min, pos2(eye.left() - 4.0, rect.bottom()));
+    let colour = if hidden { t.text_faint } else { t.text };
+    ui.painter_at(text_area).text(pos2(x + 22.0, rect.center().y), egui::Align2::LEFT_CENTER, &name, theme::regular(13.0), colour);
+    let eye_resp = ui.interact(eye, resp.id.with("eye"), Sense::click());
+    icons::paint(ui, eye, if hidden { "eye-off" } else { "eye" }, 14.0, if eye_resp.hovered() { t.text } else { t.text_muted });
+    if eye_resp.on_hover_text(if hidden { tl!("Show") } else { tl!("Hide") }).clicked() {
+        if !layers.hidden.remove(&k) {
+            layers.hidden.insert(k);
+        }
+    } else if resp.on_hover_text(tl!("Show this part with its dimensions")).clicked() {
+        layers.open = Some((node, k));
     }
 }
 

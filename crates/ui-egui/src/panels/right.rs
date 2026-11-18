@@ -195,7 +195,12 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     crate::view3d_ui::measure_controls(ui, &t, info, &mut view.view3d);
                 }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
-                    RightPanel::Model3d => crate::view3d_ui::tree_panel(ui, &t, info, &mut view.view3d),
+                    RightPanel::Model3d => {
+                        crate::view3d_ui::tree_panel(ui, &t, info, &mut view.view3d);
+                        if let Some(e) = view.view3d.take_edit() {
+                            panel_edit = Some(e);
+                        }
+                    }
                     RightPanel::Comments => {
                         if let Some(e) = crate::comments_panel::show(ui, &t, doc, view, prefs, comment_allowed, &mut nav) {
                             panel_edit = Some(e);

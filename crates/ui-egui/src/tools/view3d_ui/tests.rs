@@ -392,3 +392,96 @@ fn view3d_real_turn() {
     eprintln!("pressed {pressed:?}\n before {:?}\n after {:?}", seen_from(&before, pressed), seen_from(&after, pressed));
     assert!(close(seen_from(&after, pressed), seen_from(&before, pressed)), "the point pressed stays put");
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): a part picked, Dimension ticked, a layer made through the
+/// question, a hole measured and kept, and the layer read back from the saved file; pictures
+/// into `VIEW3D_OUT`. `cargo test -p pdfcraft-ui-egui --lib view3d_dimension_layer -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_dimension_layer() {
+    use super::Load;
+    use egui_kittest::kittest::Queryable;
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The part: the first with a whole round hole in it.
+    let (node, mesh, point) = {
+        let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!("not read") };
+        let wanted = std::env::var("VIEW3D_PART").unwrap_or_default();
+        scene
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.children.is_empty() && n.name.contains(&wanted))
+            .find_map(|(k, n)| {
+                n.meshes.iter().find_map(|&mi| {
+                    let mesh = &scene.meshes[mi].mesh;
+                    mesh.faces.iter().find_map(|f| {
+                        let fit = pdfcraft_prc_render::shapes::fit_face(mesh, f.clone());
+                        let pdfcraft_prc_render::shapes::Shape::Cylinder { sweep, .. } = fit.shape else { return None };
+                        let t = mesh.triangles[f.start];
+                        let c = [0, 1, 2].map(|a| (0..3).map(|v| mesh.positions[t[v] as usize][a]).sum::<f64>() / 3.0);
+                        (sweep > 6.0).then_some((k, mi, c))
+                    })
+                })
+            })
+            .expect("a part with a hole")
+    };
+    {
+        let v = &mut h.state_mut().views[0].view3d;
+        let m = v.models.get_mut(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        m.parts.select(&scene, Some(node));
+        eprintln!("part {}", scene.nodes[node].name);
+    }
+    h.run_steps(5);
+    // Tick Dimension, as the user does.
+    h.get_by_label("Dimension").click();
+    h.run_steps(10);
+    h.render().unwrap().save(out.join("d1-asked.png")).unwrap();
+    h.get_by_label("Yes").click();
+    h.run_steps(20);
+    let layers = |h: &Harness| {
+        let app = h.state();
+        app.session.get(app.views[0].id).unwrap().model_3d_layers(0, 0).unwrap()
+    };
+    assert_eq!(layers(&h).len(), 1, "a layer made");
+    assert_eq!(h.state().views[0].view3d.models.get(&(0, 0)).unwrap().parts.isolated, Some(node));
+    // Measure the hole and keep it.
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        m.measure.pick(&scene.meshes, mesh, point);
+        eprintln!("readings {:?}", m.measure.readings);
+    }
+    h.run_steps(5);
+    h.get_all_by_label("Keep").next().expect("Keep").click();
+    h.run_steps(20);
+    h.render().unwrap().save(out.join("d2-kept.png")).unwrap();
+    let kept = layers(&h);
+    assert_eq!(kept[0].dims.len(), 1, "{kept:?}");
+    eprintln!("kept {:?}", kept[0].dims[0]);
+    // Saved and opened again, the layer is still there.
+    let app = h.state();
+    let bytes = app.session.save_bytes(app.views[0].id).unwrap();
+    std::fs::write(out.join("dimensioned.pdf"), bytes.as_slice()).unwrap();
+    let mut again = pdfcraft_engine::Session::new();
+    let id = again.open_new("again.pdf", std::sync::Arc::new(bytes.to_vec())).unwrap();
+    assert_eq!(again.get(id).unwrap().model_3d_layers(0, 0).unwrap(), kept);
+}

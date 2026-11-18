@@ -168,16 +168,31 @@ fn label(painter: &egui::Painter, area: Rect, at: Pos2, text: &str) {
     painter.galley(at, galley, Color32::WHITE);
 }
 
-/// The Measure switch and what each shown model's measurement reads, under the section view.
+/// The Measure and Dimension switches, what each shown model's measurement reads (with Keep,
+/// onto the dimension layer being worked on), and that layer's dimensions, under the section
+/// view.
 pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info: &pdfcraft_render::DocInfo, view: &mut super::View3d) {
     if !view.models.values().any(|m| matches!(m.load, super::Load::Ready(_))) {
         return;
     }
-    let was = view.measuring;
+    let (was, was_dimensioning) = (view.measuring, view.dimensioning);
     ui.horizontal(|ui| {
         ui.add(crate::icons::image("ruler", 16.0, t.icon));
         ui.add(crate::widgets::checkbox(&mut view.measuring, egui::RichText::new(tl!("Measure")).font(crate::theme::medium(13.0))));
+        ui.add_space(12.0);
+        ui.add(crate::widgets::checkbox(&mut view.dimensioning, egui::RichText::new(tl!("Dimension")).font(crate::theme::medium(13.0))))
+            .on_hover_text(tl!("Keep measurements on the selected part as dimensions, saved in the PDF"));
     });
+    if view.dimensioning && !was_dimensioning {
+        view.measuring = true;
+        for m in view.models.values_mut() {
+            // Follow the part selected now, again.
+            m.dims_node = None;
+        }
+    }
+    if !view.measuring {
+        view.dimensioning = false;
+    }
     if view.measuring && !was {
         // A fresh start: what was measured before is no longer shown.
         for m in view.models.values_mut() {
@@ -186,32 +201,66 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
     }
     if view.measuring {
         let mut any = false;
+        let mut edit = None;
         for model in &info.annots_3d {
             let Some(m) = view.models.get_mut(&(model.page, model.index)) else { continue };
             let super::Load::Ready(scene) = &m.load else { continue };
-            let units = Units::of(scene);
-            if m.measure.picks.is_empty() {
-                continue;
+            let scene = std::sync::Arc::clone(scene);
+            let units = Units::of(&scene);
+            let frame = m.isolated_frame(&scene).map(|(_, f)| f);
+            let keeping = view.dimensioning && m.active.is_some();
+            if view.dimensioning && m.active.is_none() {
+                any = true;
+                ui.label(egui::RichText::new(tl!("Click a part, in the picture or the tree, to dimension it.")).color(t.text_muted));
             }
-            any = true;
-            for r in &m.measure.readings {
-                ui.label(egui::RichText::new(kind(r)).color(t.text_muted).font(crate::theme::regular(12.0)));
-                ui.label(egui::RichText::new(text(r, units)).font(crate::theme::semibold(14.0)));
+            if !m.measure.picks.is_empty() {
+                any = true;
+                let mut keep = None;
+                for (k, r) in m.measure.readings.iter().enumerate() {
+                    ui.label(egui::RichText::new(kind(r)).color(t.text_muted).font(crate::theme::regular(12.0)));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(text(r, units)).font(crate::theme::semibold(14.0)));
+                        if keeping && ui.small_button(tl!("Keep")).on_hover_text(tl!("Keep it as a dimension on this part")).clicked() {
+                            keep = Some(k);
+                        }
+                    });
+                }
+                if let [only] = m.measure.picks.as_slice()
+                    && m.measure.readings.is_empty()
+                {
+                    // What the face picked is, when it has no size of its own to read.
+                    let what = match only.fit.map(|f| f.shape) {
+                        Some(pdfcraft_prc_render::shapes::Shape::Plane { .. }) => tl!("A flat face."),
+                        _ => tl!("No simple shape here: a second click measures the distance between the points."),
+                    };
+                    ui.label(egui::RichText::new(what).font(crate::theme::medium(13.0)));
+                    ui.label(egui::RichText::new(tl!("Click a second face to measure between them.")).color(t.text_muted));
+                }
+                if ui.button(if keeping { tl!("Drop") } else { tl!("Clear") }).clicked() {
+                    m.measure.clear();
+                }
+                if let (Some(k), Some(frame), Some(camera), Some(active)) = (keep, frame, m.camera, m.active)
+                    && let Some(r) = m.measure.readings.get(k)
+                {
+                    let dim = super::dims::dim_of(r, &frame, &camera, units);
+                    edit = Some(m.layers_edit(model.page, model.index, |l| {
+                        if let Some(layer) = l.get_mut(active) {
+                            layer.dims.push(dim);
+                        }
+                    }));
+                    m.dim_picked = m.layers.get(active).and_then(|l| l.dims.len().checked_sub(1));
+                    m.measure.clear();
+                }
             }
-            if let [only] = m.measure.picks.as_slice()
-                && m.measure.readings.is_empty()
-            {
-                // What the face picked is, when it has no size of its own to read.
-                let what = match only.fit.map(|f| f.shape) {
-                    Some(pdfcraft_prc_render::shapes::Shape::Plane { .. }) => tl!("A flat face."),
-                    _ => tl!("No simple shape here: a second click measures the distance between the points."),
-                };
-                ui.label(egui::RichText::new(what).font(crate::theme::medium(13.0)));
-                ui.label(egui::RichText::new(tl!("Click a second face to measure between them.")).color(t.text_muted));
+            if keeping {
+                any = true;
+                if let Some(e) = layer_controls(ui, t, m, &scene, (model.page, model.index), units) {
+                    edit = Some(e);
+                }
             }
-            if ui.button(tl!("Clear")).clicked() {
-                m.measure.clear();
-            }
+        }
+        if edit.is_some() {
+            view.edit = edit;
         }
         if !any {
             ui.label(egui::RichText::new(tl!("Click a face of the model to measure it.")).color(t.text_muted));
@@ -219,6 +268,96 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
     }
     ui.add_space(4.0);
     ui.separator();
+}
+
+/// The dimension layer being worked on: its dimensions (one picked to set its tolerance or
+/// delete it) and its saved view. The edit made.
+fn layer_controls(
+    ui: &mut egui::Ui,
+    t: &crate::theme::Tokens,
+    m: &mut super::Model,
+    scene: &super::Scene,
+    (page, index): (usize, usize),
+    units: Units,
+) -> Option<pdfcraft_engine::Edit> {
+    let active = m.active?;
+    let layer = m.layers.get(active)?;
+    let mut edit = None;
+    let copies = super::dims::copies(scene, &layer.part);
+    ui.add_space(6.0);
+    let title = crate::i18n::fmt(tl!("Dimensions on {part}"), &[("part", &layer.part)]);
+    ui.label(egui::RichText::new(title).font(crate::theme::semibold(13.0)));
+    if copies > 1 {
+        let shared = crate::i18n::fmt(tl!("Shared by all {n} copies"), &[("n", &copies.to_string())]);
+        ui.label(egui::RichText::new(shared).color(t.text_muted).font(crate::theme::regular(12.0)));
+    }
+    if layer.dims.is_empty() {
+        ui.label(egui::RichText::new(tl!("Measure, then Keep, to add dimensions.")).color(t.text_muted));
+    }
+    let mut delete = None;
+    let texts: Vec<String> = layer.dims.iter().map(|d| super::dims::dim_text(d, units)).collect();
+    for (k, text) in texts.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.selectable_label(m.dim_picked == Some(k), text).clicked() {
+                m.dim_picked = if m.dim_picked == Some(k) { None } else { Some(k) };
+            }
+            if crate::icons::button(ui, "x", 20.0, false, tl!("Delete this dimension")).clicked() {
+                delete = Some(k);
+            }
+        });
+    }
+    if let Some(k) = delete {
+        m.dim_picked = None;
+        return Some(m.layers_edit(page, index, |l| {
+            if let Some(layer) = l.get_mut(active)
+                && k < layer.dims.len()
+            {
+                layer.dims.remove(k);
+            }
+        }));
+    }
+    // The picked dimension's tolerance and decimal places, kept when a change is finished.
+    if let Some(d) = m.dim_picked.and_then(|k| m.layers.get_mut(active)?.dims.get_mut(k)) {
+        let mut done = false;
+        let step = 10f64.powi(-i32::from(d.places));
+        let suffix = if d.kind == pdfcraft_engine::DimKind3d::Angle { "°" } else { "" };
+        ui.horizontal(|ui| {
+            ui.label(tl!("Tolerance"));
+            ui.label("+");
+            let plus = ui.add(egui::DragValue::new(&mut d.plus).range(0.0..=1e6).speed(step).max_decimals(6).suffix(suffix));
+            ui.label("−");
+            let minus = ui.add(egui::DragValue::new(&mut d.minus).range(0.0..=1e6).speed(step).max_decimals(6).suffix(suffix));
+            done |= [plus, minus].iter().any(|r| (r.changed() && !r.dragged()) || r.drag_stopped());
+        });
+        ui.horizontal(|ui| {
+            ui.label(tl!("Decimal places"));
+            let places = ui.add(egui::DragValue::new(&mut d.places).range(0..=6).speed(0.05));
+            done |= (places.changed() && !places.dragged()) || places.drag_stopped();
+        });
+        if done {
+            edit = Some(pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers: m.layers.clone() });
+        }
+    }
+    // The layer's view: the camera it opens on.
+    let frame = m.isolated_frame(scene).map(|(_, f)| f);
+    let saved = m.layers.get(active).and_then(|l| l.view);
+    let (mut go, mut save) = (false, false);
+    ui.horizontal(|ui| {
+        go = saved.is_some() && ui.button(tl!("Go to saved view")).clicked();
+        save = ui.button(tl!("Save this view")).on_hover_text(tl!("The layer opens on the view as it is now")).clicked();
+    });
+    if let (true, Some(v), Some(f)) = (go, saved, frame) {
+        m.camera = Some(f.camera(&v));
+    }
+    if let (true, Some(c), Some(f)) = (save, m.camera, frame) {
+        let v = f.save_view(&c);
+        edit = Some(m.layers_edit(page, index, |l| {
+            if let Some(layer) = l.get_mut(active) {
+                layer.view = Some(v);
+            }
+        }));
+    }
+    edit
 }
 
 #[cfg(test)]

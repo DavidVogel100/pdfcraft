@@ -52,6 +52,7 @@ pub(crate) fn check_permission(edit: &Edit, p: &pdfcraft_cos::Permissions) -> Re
         | Edit::PasteComments { .. }
         | Edit::AddCustomStamp { .. }
         | Edit::AddModel3d { .. }
+        | Edit::SetModel3dLayers { .. }
         | Edit::DeleteAnnotation { .. }
         | Edit::SetAnnotationContents { .. }
         | Edit::ReplyToAnnotation { .. }
@@ -655,6 +656,7 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
             let new = pdfcraft_annot::NewModel3d { page: *page, rect: *rect, model, activation: *activation, poster, contents: name };
             pdfcraft_annot::add_3d_model(doc, &new, &cx.meta())?;
         }
+        Edit::SetModel3dLayers { page, index, layers } => pdfcraft_annot::set_model_3d_layers(doc, *page, *index, layers)?,
         Edit::DeleteAnnotation { page, index } => pdfcraft_annot::delete_annotation(doc, *page, *index)?,
         Edit::SetAnnotationContents { page, index, text } => pdfcraft_annot::set_contents(doc, *page, *index, text, &cx.meta())?,
         Edit::ReplyToAnnotation { page, index, text, author } => {

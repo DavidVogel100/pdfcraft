@@ -18,6 +18,7 @@ use crate::canvas::PageXform;
 use crate::page_cursor::Layer;
 use crate::page_router::{Hit, Owner, PagePress};
 
+mod dims;
 mod measure;
 mod scene;
 #[cfg(test)]
@@ -36,6 +37,10 @@ const EDGE_REACH: f64 = 5.0;
 const SETTLE: f64 = 0.25;
 const BACKGROUND: [u8; 4] = [255, 255, 255, 255];
 
+/// A question about making a dimension layer: the model (page, annotation), the part, and how
+/// many copies of it the assembly has.
+type Ask = ((usize, usize), String, usize);
+
 /// Every 3D model of a document the viewer has met, and this frame's wheel over them.
 #[derive(Default)]
 pub(crate) struct View3d {
@@ -49,6 +54,20 @@ pub(crate) struct View3d {
     section: tree::SectionState,
     /// The Measure tool is on: a click on a model picks a face to measure, not a part.
     measuring: bool,
+    /// Dimensioning is on: the part selected is isolated and what is measured can be kept on
+    /// its dimension layer.
+    dimensioning: bool,
+    /// Asking whether to make a dimension layer for a part: which model, the part, its copies.
+    ask: Option<Ask>,
+    /// An edit to the document made here, for the app to apply.
+    edit: Option<pdfcraft_engine::Edit>,
+}
+
+impl View3d {
+    /// The edit made here since last asked, for the app to apply.
+    pub(crate) fn take_edit(&mut self) -> Option<pdfcraft_engine::Edit> {
+        self.edit.take()
+    }
 }
 
 struct Model {
@@ -82,6 +101,41 @@ struct Model {
     /// Whether the model is drawn across its whole page, not only in its annotation's box: when
     /// nothing else is drawn on the page around the box, as CAD programs export a model alone.
     whole_page: bool,
+    /// The dimension and note layers kept in the document, as read at edit generation
+    /// `layers_read`.
+    layers: Vec<pdfcraft_engine::Layer3d>,
+    layers_read: Option<u64>,
+    /// The dimension layer being worked on.
+    active: Option<usize>,
+    /// Layers the user hid.
+    hidden_layers: std::collections::HashSet<usize>,
+    /// The dimension picked on the active layer, and one being moved (with where on its text
+    /// it was taken).
+    dim_picked: Option<usize>,
+    dim_drag: Option<(usize, egui::Vec2)>,
+    /// Where the active layer's dimension texts were drawn last frame (screen).
+    dim_hits: Vec<(usize, Rect)>,
+    /// The node dimensioning last followed, and the part whose new layer to make active.
+    dims_node: Option<usize>,
+    want_part: Option<String>,
+}
+
+impl Model {
+    /// The model's layers with `change` made, as an edit for the app (the layers are read back
+    /// from the document once it is applied).
+    fn layers_edit(&mut self, page: usize, index: usize, change: impl FnOnce(&mut Vec<pdfcraft_engine::Layer3d>)) -> pdfcraft_engine::Edit {
+        let mut layers = self.layers.clone();
+        change(&mut layers);
+        // Shown at once, before the document is read back.
+        self.layers.clone_from(&layers);
+        pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers }
+    }
+
+    /// The part isolated, and its own coordinates.
+    fn isolated_frame(&self, scene: &Scene) -> Option<(usize, dims::PartFrame)> {
+        let node = self.parts.isolated?;
+        Some((node, dims::frame_of(scene, node)))
+    }
 }
 
 enum Load {
@@ -162,8 +216,9 @@ pub(crate) fn page_input(
     cursor: &mut crate::page_cursor::PageCursor,
 ) -> bool {
     let PagePress::Mine(Owner::Model3d { index }) = press else { return false };
-    let measuring = view.measuring;
     let Some(m) = view.models.get_mut(&(page, index)) else { return false };
+    // Dimensioning with no part chosen yet: a click picks the part, not a face.
+    let measuring = view.measuring && !(view.dimensioning && m.active.is_none());
     let now = ui.input(|i| i.time);
     let height = f64::from(m.screen.map_or(400.0, |r| r.height()));
     // Shift as the key state says, or as this frame's press carried it: the key state can lag
@@ -184,6 +239,46 @@ pub(crate) fn page_input(
         _ => None,
     };
     let Some(camera) = m.camera.as_mut() else { return true };
+    // A dimension's text on the layer being worked on: picked by a click, moved by a drag.
+    let on_dim = |at: Pos2| m.dim_hits.iter().rev().find(|(_, r)| r.contains(at)).map(|&(k, r)| (k, at - r.center()));
+    if ptr.drag_started
+        && m.active.is_some()
+        && let Some(hit) = m.press_at.or(ptr.origin).and_then(on_dim)
+    {
+        m.dim_drag = Some(hit);
+        m.dim_picked = Some(hit.0);
+    }
+    if let Some((k, grab)) = m.dim_drag {
+        if let (Some(p), Some(r), Some((drawn_with, size, _)), Load::Ready(scene)) = (resp.interact_pointer_pos(), m.screen, m.drawn, &m.load) {
+            let frame = m.parts.isolated.map_or(dims::PartFrame::IDENTITY, |n| dims::frame_of(scene, n));
+            if let Some(d) = m.active.and_then(|a| m.layers.get_mut(a)).and_then(|l| l.dims.get_mut(k)) {
+                // Moved across the view, at the depth it was.
+                let at = p - grab;
+                let x = f64::from((at.x - r.left()) / r.width().max(1.0)) * f64::from(size[0]);
+                let y = f64::from((at.y - r.top()) / r.height().max(1.0)) * f64::from(size[1]);
+                let world = frame.world_of(d.text_at);
+                let depth =
+                    scene::normalize(scene::sub(drawn_with.target, drawn_with.eye)).map_or(1.0, |f| scene::dot(scene::sub(world, drawn_with.eye), f));
+                if let Some(moved) = drawn_with.unproject(x, y, size[0], size[1], depth) {
+                    d.text_at = frame.local_of(moved);
+                }
+            }
+        }
+        if !resp.dragged() || resp.drag_stopped() {
+            m.dim_drag = None;
+            view.edit = Some(pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers: m.layers.clone() });
+        }
+        cursor.claim(Layer::Drag, egui::CursorIcon::Move);
+        ui.ctx().request_repaint();
+        return true;
+    }
+    if resp.clicked()
+        && m.active.is_some()
+        && let Some((k, _)) = resp.interact_pointer_pos().and_then(on_dim)
+    {
+        m.dim_picked = if m.dim_picked == Some(k) { None } else { Some(k) };
+        return true;
+    }
     if resp.dragged() {
         let other_button = resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle);
         // Decided as the drag starts; Shift pressed partway through still switches to moving.
@@ -305,6 +400,15 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             press_at: None,
             turn_about: None,
             whole_page: alone_on_page(doc, info, page, model),
+            layers: Vec::new(),
+            layers_read: None,
+            active: None,
+            hidden_layers: std::collections::HashSet::new(),
+            dim_picked: None,
+            dim_drag: None,
+            dim_hits: Vec::new(),
+            dims_node: None,
+            want_part: None,
         });
         // The area the model is drawn in: its box, or its whole page.
         let box_rect = r;
@@ -353,6 +457,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
                 m.home = Some(c);
             }
         }
+        layers_step(ctx, doc, m, &scene, (page, model.index), (&mut view.dimensioning, &mut view.ask, &mut view.edit));
         let Some(mut camera) = m.camera else {
             label(&painter, r, paper, &[tl!("This 3D model can't be shown").to_owned(), tl!("its view can't be formed").to_owned()]);
             continue;
@@ -411,8 +516,26 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         if let Some(t) = &m.texture {
             painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
+        m.dim_hits.clear();
         if let Some((drawn_with, drawn_size, _)) = m.drawn {
-            measure::paint(&painter, r, drawn_size, &drawn_with, &m.measure, measure::Units::of(&scene));
+            let units = measure::Units::of(&scene);
+            // The isolated part's layers.
+            if let Some((node, frame)) = m.isolated_frame(&scene) {
+                let part = dims::part_name(&scene, node);
+                let copies = dims::copies(&scene, &part);
+                for (k, layer) in m.layers.iter().enumerate() {
+                    if layer.part != part || layer.kind != pdfcraft_engine::LayerKind3d::Dimensions || m.hidden_layers.contains(&k) {
+                        continue;
+                    }
+                    let active = view.dimensioning && m.active == Some(k);
+                    let shown = dims::Shown { layer, active, picked: if active { m.dim_picked } else { None }, copies };
+                    let hits = dims::paint(&painter, r, drawn_size, &drawn_with, &frame, &shown, units);
+                    if active {
+                        m.dim_hits = hits;
+                    }
+                }
+            }
+            measure::paint(&painter, r, drawn_size, &drawn_with, &m.measure, units);
         }
         // While a drag is on, say which it does: the system draws the same cursor for both on
         // Windows, so the frame and a corner label show it.
@@ -428,6 +551,157 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         m.screen = Some(r);
         view.rects.push(r);
     }
+}
+
+/// Each frame, before the model is drawn: its layers read again after an edit, the part
+/// selected followed while dimensioning, and whether to make a layer for it asked.
+fn layers_step(
+    ctx: &egui::Context,
+    doc: &pdfcraft_engine::Document,
+    m: &mut Model,
+    scene: &Scene,
+    key: (usize, usize),
+    (dimensioning, asking, edit): (&mut bool, &mut Option<Ask>, &mut Option<pdfcraft_engine::Edit>),
+) {
+    // The layers kept in the document, read again after every edit (an undo too).
+    let generation = doc.edit_generation();
+    if m.layers_read != Some(generation) && m.dim_drag.is_none() {
+        m.layers = doc.model_3d_layers(key.0, key.1).unwrap_or_default();
+        m.layers_read = Some(generation);
+        m.active = m.active.filter(|&a| a < m.layers.len());
+        if let Some(part) = m.want_part.take() {
+            m.active = dims::layer_for(&m.layers, &part);
+        }
+        let count = m.active.and_then(|a| m.layers.get(a)).map_or(0, |l| l.dims.len());
+        m.dim_picked = m.dim_picked.filter(|&k| k < count);
+    }
+    if let Some(question) = follow_selection(*dimensioning, m, scene, key) {
+        *asking = Some(question);
+    }
+    if asking.as_ref().is_some_and(|(k, ..)| *k == key)
+        && let Some(answer) = ask_for_layer(ctx, asking.as_ref().map(|(_, part, n)| (part.as_str(), *n)).unwrap_or_default())
+    {
+        let part = asking.take().map(|(_, part, _)| part).unwrap_or_default();
+        if answer {
+            let frame = m.isolated_frame(scene).map_or(dims::PartFrame::IDENTITY, |(_, f)| f);
+            let view_saved = m.camera.map(|c| frame.save_view(&c));
+            let layer = pdfcraft_engine::Layer3d {
+                part: part.clone(),
+                kind: pdfcraft_engine::LayerKind3d::Dimensions,
+                name: tl!("Dimensions").to_owned(),
+                view: view_saved,
+                dims: Vec::new(),
+            };
+            *edit = Some(m.layers_edit(key.0, key.1, |l| l.push(layer)));
+            m.active = dims::layer_for(&m.layers, &part);
+            m.want_part = Some(part);
+        } else {
+            *dimensioning = false;
+        }
+    }
+}
+
+/// While dimensioning: the part selected is isolated and its dimension layer made the one worked
+/// on, or, when it has none, whether to make one is asked (the model, the part, its copies).
+fn follow_selection(dimensioning: bool, m: &mut Model, scene: &Scene, key: (usize, usize)) -> Option<Ask> {
+    if !dimensioning {
+        m.dims_node = None;
+        m.active = None;
+        m.dim_picked = None;
+        return None;
+    }
+    let node = m.parts.selected?;
+    if m.dims_node == Some(node) {
+        return None;
+    }
+    m.dims_node = Some(node);
+    if m.parts.isolated != Some(node) {
+        m.parts.isolated = Some(node);
+        let under = scene.subtree(node);
+        m.parts.hidden.retain(|h| !under.contains(h));
+        m.parts.changed();
+    }
+    m.measure.clear();
+    m.dim_picked = None;
+    let part = dims::part_name(scene, node);
+    match dims::layer_for(&m.layers, &part) {
+        Some(k) => {
+            m.active = Some(k);
+            // Turned to the view the layer was made in.
+            if let Some(v) = m.layers.get(k).and_then(|l| l.view) {
+                m.camera = Some(dims::frame_of(scene, node).camera(&v));
+            }
+            None
+        }
+        None => {
+            m.active = None;
+            if let Some(c) = m.camera.as_mut() {
+                fit_part(c, scene, node);
+            }
+            let copies = dims::copies(scene, &part);
+            Some((key, part, copies))
+        }
+    }
+}
+
+/// Turns nothing but moves `camera` in or out and across so `node`'s part fills the view.
+fn fit_part(camera: &mut Camera, scene: &Scene, node: usize) {
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for k in scene.subtree(node) {
+        for &mi in scene.nodes.get(k).map_or(&[][..], |n| n.meshes.as_slice()) {
+            for p in scene.meshes.get(mi).map_or(&[][..], |m| m.mesh.positions.as_slice()) {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+        }
+    }
+    if !(0..3).all(|a| lo[a].is_finite() && hi[a].is_finite()) {
+        return;
+    }
+    let centre = scene::scale(scene::add(lo, hi), 0.5);
+    let half = scene::sub(hi, lo);
+    let radius = (scene::dot(half, half).sqrt() / 2.0).max(1e-9);
+    let Some(forward) = scene::normalize(scene::sub(camera.target, camera.eye)) else { return };
+    let distance = match &mut camera.projection {
+        pdfcraft_prc_render::Projection::Perspective { fov_y } => radius * 1.15 / (fov_y.to_radians() / 2.0).sin(),
+        pdfcraft_prc_render::Projection::Orthographic { height } => {
+            *height = radius * 2.3;
+            radius * 4.0
+        }
+    };
+    camera.target = centre;
+    camera.eye = scene::sub(centre, scene::scale(forward, distance));
+}
+
+/// Asks whether to make a dimension layer for `part` (with `copies` copies): `Some(true)` for
+/// Yes, `Some(false)` for Cancel, `None` while it is open.
+fn ask_for_layer(ctx: &egui::Context, (part, copies): (&str, usize)) -> Option<bool> {
+    let mut answer = None;
+    let modal = crate::widgets::show_modal(ctx, "view3d-dimension-layer", |ui| {
+        ui.set_width(380.0);
+        let question = crate::i18n::fmt(tl!("Create a Dimension layer for {part}?"), &[("part", part)]);
+        ui.add(egui::Label::new(egui::RichText::new(question).font(crate::theme::semibold(15.0))).wrap());
+        if copies > 1 {
+            ui.add_space(4.0);
+            let note = crate::i18n::fmt(tl!("It will show on all {n} copies of this part."), &[("n", &copies.to_string())]);
+            ui.label(note);
+        }
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::widgets::pill_button(ui, tl!("Yes"), true).clicked() {
+                answer = Some(true);
+            }
+            if crate::widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(false);
+    }
+    answer
 }
 
 /// Whether `model` is the only thing on its page: no other annotation or link there, and every

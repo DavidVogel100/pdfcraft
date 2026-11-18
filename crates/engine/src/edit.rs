@@ -180,6 +180,13 @@ pub enum Edit {
         activation: pdfcraft_annot::Activation3d,
         name: String,
     },
+    /// Model Tree ▸ Dimension: replace the dimension and note layers kept on the 3D annotation at
+    /// `/Annots` position `index` on `page`.
+    SetModel3dLayers {
+        page: usize,
+        index: usize,
+        layers: Vec<pdfcraft_annot::Layer3d>,
+    },
     /// Delete the comment at `index` in the page's `/Annots`, with its pop-up and replies.
     DeleteAnnotation {
         page: usize,

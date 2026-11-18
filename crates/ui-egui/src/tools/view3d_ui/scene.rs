@@ -27,6 +27,9 @@ pub(crate) struct Scene {
     pub(crate) outlines: std::sync::Arc<[Vec<[u32; 2]>]>,
     /// The model's unit, when the file says what it is.
     pub(crate) units: Option<craft_prc::ModelUnits>,
+    /// Per mesh, the matrix that placed it (world = matrix × its own coordinates): a part's
+    /// own coordinates, the same for every copy of it.
+    pub(crate) placed_by: Vec<Option<[[f64; 4]; 4]>>,
 }
 
 impl Scene {
@@ -61,7 +64,9 @@ impl Scene {
         let bounds = Bounds::of(&meshes);
         let units = prc.units().ok().flatten();
         let outlines = meshes.iter().map(|m| pdfcraft_prc_render::outline_edges(&m.mesh)).collect();
-        Ok(Scene { meshes, nodes, mesh_nodes, bounds, outlines, units })
+        let placements = prc.placements().unwrap_or_default();
+        let placed_by = meshes.iter().map(|m| m.placement.and_then(|p| placements.get(p)).map(|p| p.matrix.0)).collect();
+        Ok(Scene { meshes, nodes, mesh_nodes, bounds, outlines, units, placed_by })
     }
 
     /// The nodes with no parent.
@@ -194,27 +199,27 @@ fn rotate(v: [f64; 3], axis: [f64; 3], angle: f64) -> [f64; 3] {
     add(add(scale(v, c), scale(cross(axis, v), s)), scale(axis, k))
 }
 
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn scale(a: [f64; 3], k: f64) -> [f64; 3] {
+pub(crate) fn scale(a: [f64; 3], k: f64) -> [f64; 3] {
     a.map(|v| v * k)
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-fn normalize(a: [f64; 3]) -> Option<[f64; 3]> {
+pub(crate) fn normalize(a: [f64; 3]) -> Option<[f64; 3]> {
     let len = dot(a, a).sqrt();
     (len.is_finite() && len > 0.0).then(|| scale(a, 1.0 / len))
 }
