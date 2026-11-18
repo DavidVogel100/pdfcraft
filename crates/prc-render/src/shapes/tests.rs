@@ -129,7 +129,7 @@ fn a_fillet_one_strip_wide_takes_its_radius_from_the_faces_it_joins() {
     // corners on the arc but only one strip of triangles across.
     let (r, len) = (0.25, 3.0);
     let mut m = TriangleMesh::default();
-    let mut quad = |m: &mut TriangleMesh, corners: [[f64; 3]; 4]| {
+    let quad = |m: &mut TriangleMesh, corners: [[f64; 3]; 4]| {
         let n = u32::try_from(m.positions.len()).unwrap();
         m.positions.extend(corners);
         let start = m.triangles.len();

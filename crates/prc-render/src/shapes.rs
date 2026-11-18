@@ -162,7 +162,7 @@ fn fillet_between_neighbours(mesh: &TriangleMesh, face: usize, tolerance: f64) -
         .map(|(g, range)| (g, corners_of(mesh, range.clone()).0.into_iter().filter(|&p| mine.contains(&key(p))).collect::<Vec<_>>()))
         .filter(|(_, pts)| pts.len() >= 2)
         .collect();
-    shared.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    shared.sort_by_key(|(_, pts)| std::cmp::Reverse(pts.len()));
     let [(ga, edge_a), (gb, edge_b), ..] = shared.as_slice() else { return None };
     let plane_of = |g: usize| match fit_face(mesh, mesh.faces.get(g)?.clone()).shape {
         Shape::Plane { normal, .. } => Some(normal),
