@@ -121,3 +121,40 @@ fn eigenvectors_and_solves_hold_for_simple_cases() {
     assert_eq!(solve3([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 4.0]], [1.0, 1.0, 1.0]), Some([1.0, 0.5, 0.25]));
     assert_eq!(solve3([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 0.0, 1.0]], [1.0, 1.0, 1.0]), None);
 }
+
+#[test]
+fn a_fillet_one_strip_wide_takes_its_radius_from_the_faces_it_joins() {
+    // An L of two plates meeting round a 0.25 fillet: a floor (z = 0, x from 0.25 to 2), a wall
+    // (x = 0, z from 0.25 to 2), and the fillet between them, centred on (0.25, *, 0.25), its
+    // corners on the arc but only one strip of triangles across.
+    let (r, len) = (0.25, 3.0);
+    let mut m = TriangleMesh::default();
+    let mut quad = |m: &mut TriangleMesh, corners: [[f64; 3]; 4]| {
+        let n = u32::try_from(m.positions.len()).unwrap();
+        m.positions.extend(corners);
+        let start = m.triangles.len();
+        m.triangles.extend([[n, n + 1, n + 2], [n, n + 2, n + 3]]);
+        m.faces.push(start..start + 2);
+    };
+    quad(&mut m, [[r, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, len, 0.0], [r, len, 0.0]]);
+    quad(&mut m, [[0.0, 0.0, r], [0.0, len, r], [0.0, len, 2.0], [0.0, 0.0, 2.0]]);
+    // The fillet strip from the floor's edge (x = r, z = 0) to the wall's (x = 0, z = r).
+    quad(&mut m, [[r, 0.0, 0.0], [r, len, 0.0], [0.0, len, r], [0.0, 0.0, r]]);
+    assert!(matches!(fit_face(&m, m.faces[2].clone()).shape, Shape::Plane { .. }), "on its own it lies flat");
+    let f = fit_face_in(&m, 2);
+    let Shape::Cylinder { radius, sweep, axis, point } = f.shape else { panic!("{f:?}") };
+    assert!((radius - r).abs() < 1e-12, "R {radius}");
+    assert!((sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    assert!((axis[1].abs() - 1.0).abs() < 1e-12);
+    assert!((point[0] - r).abs() < 1e-12 && (point[2] - r).abs() < 1e-12, "{point:?}");
+    // The plates themselves stay planes.
+    assert!(matches!(fit_face_in(&m, 0).shape, Shape::Plane { .. }));
+    // A rounded outside edge the same way: the strip from the top's edge (x = 1.75, z = 2) to the
+    // side's (x = 2, z = 1.75), round a centre at (1.75, *, 1.75).
+    let mut m = TriangleMesh::default();
+    quad(&mut m, [[0.0, 0.0, 2.0], [1.75, 0.0, 2.0], [1.75, len, 2.0], [0.0, len, 2.0]]);
+    quad(&mut m, [[2.0, 0.0, 0.0], [2.0, len, 0.0], [2.0, len, 1.75], [2.0, 0.0, 1.75]]);
+    quad(&mut m, [[1.75, 0.0, 2.0], [1.75, len, 2.0], [2.0, len, 1.75], [2.0, 0.0, 1.75]]);
+    let Shape::Cylinder { radius, point, .. } = fit_face_in(&m, 2).shape else { panic!() };
+    assert!((radius - r).abs() < 1e-12 && (point[0] - 1.75).abs() < 1e-12 && (point[2] - 1.75).abs() < 1e-12, "{radius} {point:?}");
+}

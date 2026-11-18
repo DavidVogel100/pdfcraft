@@ -130,6 +130,80 @@ pub fn fit_face(mesh: &TriangleMesh, triangles: Range<usize>) -> Fit {
     [cylinder, sphere].into_iter().flatten().map(fit).find(|f| f.deviation <= tolerance).unwrap_or(other(tolerance))
 }
 
+/// The surface of `mesh`'s face number `face`: as [`fit_face`] finds it, or, for a fillet
+/// tessellated too coarsely to show its curve (one strip of triangles across, which lies flat),
+/// the round its two neighbouring faces imply: it meets both tangentially, so their angle and
+/// its width fix its radius.
+#[must_use]
+pub fn fit_face_in(mesh: &TriangleMesh, face: usize) -> Fit {
+    let Some(range) = mesh.faces.get(face).cloned() else {
+        return Fit { shape: Shape::Other, deviation: 0.0, tolerance: ABSOLUTE_TOLERANCE, corners: 0 };
+    };
+    let fit = fit_face(mesh, range);
+    if matches!(fit.shape, Shape::Cylinder { .. } | Shape::Sphere { .. }) {
+        return fit;
+    }
+    fillet_between_neighbours(mesh, face, fit.tolerance).map_or(fit, |(shape, deviation)| Fit { shape, deviation, ..fit })
+}
+
+/// The fillet face `face` of `mesh` is, from its neighbours: the two faces it shares the most
+/// corners with, both planes at an angle; the cylinder tangent to both through the corners it
+/// shares with each. With how far its own corners lie from it, which must be within `tolerance`.
+fn fillet_between_neighbours(mesh: &TriangleMesh, face: usize, tolerance: f64) -> Option<(Shape, f64)> {
+    let key = |p: [f64; 3]| p.map(f64::to_bits);
+    let (own, _) = corners_of(mesh, mesh.faces.get(face)?.clone());
+    let mine: std::collections::HashSet<[u64; 3]> = own.iter().map(|&p| key(p)).collect();
+    // Each other face's corners shared with this one.
+    let mut shared: Vec<(usize, Vec<[f64; 3]>)> = mesh
+        .faces
+        .iter()
+        .enumerate()
+        .filter(|&(g, _)| g != face)
+        .map(|(g, range)| (g, corners_of(mesh, range.clone()).0.into_iter().filter(|&p| mine.contains(&key(p))).collect::<Vec<_>>()))
+        .filter(|(_, pts)| pts.len() >= 2)
+        .collect();
+    shared.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let [(ga, edge_a), (gb, edge_b), ..] = shared.as_slice() else { return None };
+    let plane_of = |g: usize| match fit_face(mesh, mesh.faces.get(g)?.clone()).shape {
+        Shape::Plane { normal, .. } => Some(normal),
+        _ => None,
+    };
+    let (mut na, mut nb) = (plane_of(*ga)?, plane_of(*gb)?);
+    // Both normals turned to the fillet's own side, so the angle between them is its sweep.
+    let Shape::Plane { normal: chord_normal, .. } = plane(&own)? else { return None };
+    if dot(na, chord_normal) < 0.0 {
+        na = scale(na, -1.0);
+    }
+    if dot(nb, chord_normal) < 0.0 {
+        nb = scale(nb, -1.0);
+    }
+    let sweep = dot(na, nb).clamp(-1.0, 1.0).acos();
+    if !(sweep > 2f64.to_radians() && sweep < 178f64.to_radians()) {
+        return None;
+    }
+    let axis = normalize(cross(na, nb))?;
+    let (ca, cb) = (centroid(edge_a), centroid(edge_b));
+    let across = |v: [f64; 3]| sub(v, scale(axis, dot(v, axis)));
+    let chord = length(across(sub(cb, ca)));
+    let radius = chord / (2.0 * (sweep / 2.0).sin());
+    if !(radius.is_finite() && radius > 0.0) {
+        return None;
+    }
+    // The axis lies a radius from each tangent edge along its face's normal: one way for a
+    // fillet in a corner, the other for a rounded edge. The side where both agree is the one.
+    let centre = |side: f64| {
+        let (from_a, from_b) = (add(ca, scale(na, side * radius)), add(cb, scale(nb, side * radius)));
+        (scale(add(from_a, from_b), 0.5), length(across(sub(from_b, from_a))))
+    };
+    let (point, gap) = [centre(1.0), centre(-1.0)].into_iter().min_by(|a, b| a.1.total_cmp(&b.1))?;
+    if gap > radius * 0.05 + tolerance {
+        return None;
+    }
+    let shape = Shape::Cylinder { point, axis, radius, sweep };
+    let deviation = own.iter().map(|&p| distance(&shape, p)).fold(0.0, f64::max);
+    (deviation <= tolerance.max(radius * 1e-3)).then_some((shape, deviation))
+}
+
 /// How far `p` lies from `shape` (0 for [`Shape::Other`]).
 #[must_use]
 pub fn distance(shape: &Shape, p: [f64; 3]) -> f64 {

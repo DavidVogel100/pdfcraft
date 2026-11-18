@@ -7,7 +7,7 @@
 
 use craft_prc::TriangleMesh;
 
-use crate::shapes::{Fit, Shape, fit_face};
+use crate::shapes::{Fit, Shape, fit_face_in};
 use crate::vec3::{add, cross, dot, length, normalize, scale, sub};
 
 /// Directions within this angle count as parallel (or square), radians: half a degree.
@@ -73,7 +73,8 @@ pub fn face_at(mesh: &TriangleMesh, point: [f64; 3]) -> Option<usize> {
 pub fn picked(meshes: &[crate::WorldMesh], pick: Pick) -> Picked {
     let fit = pick.face.and_then(|f| {
         let mesh = &meshes.get(pick.mesh)?.mesh;
-        Some(fit_face(mesh, mesh.faces.get(f)?.clone()))
+        mesh.faces.get(f)?;
+        Some(fit_face_in(mesh, f))
     });
     Picked { pick, fit }
 }
