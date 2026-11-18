@@ -180,3 +180,67 @@ Deburr"
     let mut text = doc("[4 0 R]", &[b"<< /Type /Annot /Subtype /Text /Rect [0 0 1 1] >>".to_vec()]);
     assert!(set_model_3d_layers(&mut text, 0, 0, &[]).is_err());
 }
+
+#[test]
+fn layers_are_written_as_views_acrobat_shows_and_replaced_on_every_change() {
+    let mut d = doc(
+        "[4 0 R]",
+        &[
+            b"<< /Type /Annot /Subtype /3D /Rect [0 0 1 1] /3DD 5 0 R >>".to_vec(),
+            stream("/Type /3D /Subtype /PRC /VA [6 0 R]", b"PRC"),
+            b"<< /Type /3DView /XN (Home) >>".to_vec(),
+        ],
+    );
+    let view = StandardView3d {
+        name: "Lid - Dimensions".into(),
+        eye: [0.0, -10.0, 0.0],
+        target: [0.0; 3],
+        up: [0.0, 0.0, 1.0],
+        ortho_height: Some(4.0),
+        fov_y: 30.0,
+        hide: vec!["Box-1".into()],
+        measures: vec![
+            StandardMeasure3d::Linear {
+                from: [0.0; 3],
+                to: [1.0, 0.0, 0.0],
+                text_at: [0.5, 0.0, 0.3],
+                value: 1.0,
+                units: "in".into(),
+                places: 3,
+                after: String::new(),
+                label: "1.000".into(),
+            },
+            StandardMeasure3d::Radial {
+                centre: [0.0; 3],
+                on: [0.2, 0.0, 0.0],
+                text_at: [0.4, 0.0, 0.2],
+                value: 0.4,
+                radius: false,
+                units: "in".into(),
+                places: 3,
+                after: " ±0.005".into(),
+                label: "Ø0.400".into(),
+            },
+            StandardMeasure3d::Comment { anchor: [0.0; 3], text_at: [0.0, 0.0, 1.0], text: "Break edges".into() },
+        ],
+    };
+    set_standard_views(&mut d, 0, 0, std::slice::from_ref(&view)).unwrap();
+    let views = |d: &Document| {
+        let s = d.get(pdfcraft_cos::ObjRef::new(5, 0));
+        let Object::Stream(s) = s.as_ref() else { panic!() };
+        let r = s.dict.reference(b"VA").expect("its views an object of their own");
+        d.get(r).as_array().unwrap().iter().map(|v| d.resolve(v).as_dict().unwrap().clone()).collect::<Vec<_>>()
+    };
+    let v = views(&d);
+    assert_eq!(v.len(), 2, "the file's own view kept, one added");
+    assert_eq!(v[1].get(b"MA").and_then(Object::as_array).map(Vec::len), Some(3));
+    assert_eq!(v[1].get(b"MA").and_then(Object::as_array).and_then(|a| a[0].as_dict()).and_then(|m| m.name(b"Subtype")), Some(&b"LD3"[..]));
+    // Written again: replaced, not added to; none: only the file's own.
+    set_standard_views(&mut d, 0, 0, &[view.clone(), view]).unwrap();
+    assert_eq!(views(&d).len(), 3);
+    set_standard_views(&mut d, 0, 0, &[]).unwrap();
+    assert_eq!(views(&d).len(), 1);
+    // Read back by the 3D view reader as the camera it was.
+    let bytes = pdfcraft_cos::write_incremental(&d, &pdfcraft_cos::SaveOptions::default()).unwrap();
+    assert!(Document::open(Arc::new(bytes)).is_ok());
+}

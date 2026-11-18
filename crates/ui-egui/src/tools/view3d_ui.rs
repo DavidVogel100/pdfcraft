@@ -22,6 +22,7 @@ mod dims;
 mod measure;
 mod scene;
 mod sheet;
+mod standard;
 #[cfg(test)]
 mod tests;
 mod tree;
@@ -155,7 +156,12 @@ impl Model {
         change(&mut layers);
         // Shown at once, before the document is read back.
         self.layers.clone_from(&layers);
-        pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers }
+        // And as Acrobat shows them.
+        let views = match &self.load {
+            Load::Ready(scene) => standard::standard_views(scene, &layers, measure::Units::of(scene)),
+            _ => Vec::new(),
+        };
+        pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers, views }
     }
 
     /// The part isolated, and its own coordinates.
@@ -333,7 +339,7 @@ pub(crate) fn page_input(
         }
         if !resp.dragged() || resp.drag_stopped() {
             m.dim_drag = None;
-            view.edit = Some(pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers: m.layers.clone() });
+            view.edit = Some(m.layers_edit(page, index, |_| {}));
         }
         cursor.claim(Layer::Drag, egui::CursorIcon::Move);
         ui.ctx().request_repaint();
@@ -469,7 +475,7 @@ fn notes_input(
         }
         if !resp.dragged() || resp.drag_stopped() {
             m.note_drag = None;
-            *edit = Some(pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers: m.layers.clone() });
+            *edit = Some(m.layers_edit(page, index, |_| {}));
         }
         cursor.claim(Layer::Drag, egui::CursorIcon::Move);
         ui.ctx().request_repaint();

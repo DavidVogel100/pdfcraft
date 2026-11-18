@@ -133,7 +133,7 @@ pub use pdfcraft_annot::{
     OverlayFont, OverlayLook, Props as CommentProps, ReviewState, Rgb, Shape, Side as CalloutSide, StampGroup, StampKind, Style, callout_attach,
     callout_knee, callout_side, rect_quad,
 };
-pub use pdfcraft_annot::{Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, Note3d, NotePlace3d};
+pub use pdfcraft_annot::{Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, Note3d, NotePlace3d, StandardMeasure3d, StandardView3d};
 pub use pdfcraft_annot::{MAX_MODEL_BYTES as MAX_3D_MODEL_BYTES, ModelFormat as Model3dFormat};
 pub use pdfcraft_forms::detect;
 pub use pdfcraft_optimize as optimize;

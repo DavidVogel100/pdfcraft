@@ -43,7 +43,8 @@ pub use lookup::{
 };
 pub use model3d::{
     Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, MAX_DIMENSIONS, MAX_LAYERS, MAX_NOTE_CHARS, MAX_NOTES, Model3d, Model3dKind, Note3d,
-    NotePlace3d, model_3d, model_3d_annotations, model_3d_layers, set_model_3d_layers, shown_model_3d_positions,
+    NotePlace3d, StandardMeasure3d, StandardView3d, model_3d, model_3d_annotations, model_3d_layers, set_model_3d_layers, set_standard_views,
+    shown_model_3d_positions,
 };
 pub(crate) use modify::n;
 pub use modify::{

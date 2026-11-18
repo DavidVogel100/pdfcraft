@@ -491,6 +491,28 @@ fn view3d_dimension_layer() {
     let mut again = pdfcraft_engine::Session::new();
     let id = again.open_new("again.pdf", std::sync::Arc::new(bytes.to_vec())).unwrap();
     assert_eq!(again.get(id).unwrap().model_3d_layers(0, 0).unwrap(), kept);
+    // Written for Acrobat too: a view with the measurement, the file rewritten once rather than
+    // a second copy of the model appended, and the model still read.
+    let original = std::fs::metadata(&pdf).unwrap().len() as f64;
+    eprintln!("saved {} bytes, was {original}", bytes.len());
+    assert!((bytes.len() as f64) < original * 1.3, "not doubled");
+    let cos = pdfcraft_cos::Document::open(std::sync::Arc::new(bytes.to_vec())).unwrap();
+    let d = |o: &pdfcraft_cos::Object| cos.resolve(o).as_dict().cloned().unwrap();
+    let catalog = cos.get(cos.root().unwrap()).as_dict().cloned().unwrap();
+    let pages = d(catalog.get(b"Pages").unwrap());
+    let page = d(&cos.resolve(pages.get(b"Kids").unwrap()).as_array().unwrap()[0]);
+    let annot = d(&cos.resolve(page.get(b"Annots").unwrap()).as_array().unwrap()[0]);
+    let stream = cos.resolve(annot.get(b"3DD").unwrap());
+    let pdfcraft_cos::Object::Stream(stream) = stream.as_ref() else { panic!("a 3D stream") };
+    let views: Vec<_> = cos.resolve(stream.dict.get(b"VA").unwrap()).as_array().unwrap().iter().map(|v| d(v)).collect();
+    eprintln!("{} views", views.len());
+    let ours: Vec<_> = views.iter().filter(|v| v.get(b"PCft3DView").is_some()).collect();
+    assert_eq!(ours.len(), 1, "an Acrobat view for the layer");
+    let ma = cos.resolve(ours[0].get(b"MA").unwrap()).as_array().unwrap().clone();
+    assert_eq!(d(&ma[0]).name(b"Subtype"), Some(&b"RD3"[..]));
+    eprintln!("view {:?}", ours[0]);
+    let model = again.get(id).unwrap().model_3d(0, 0).unwrap();
+    assert!(super::scene::Scene::read(&model.data).is_ok());
 }
 
 /// On a real 3D PDF (`VIEW3D_PDF`): a part picked, Note ticked, a notes layer made, a note

@@ -181,11 +181,13 @@ pub enum Edit {
         name: String,
     },
     /// Model Tree ▸ Dimension: replace the dimension and note layers kept on the 3D annotation at
-    /// `/Annots` position `index` on `page`.
+    /// `/Annots` position `index` on `page`, and the 3D views written for them so Acrobat shows
+    /// them too (one per layer).
     SetModel3dLayers {
         page: usize,
         index: usize,
         layers: Vec<pdfcraft_annot::Layer3d>,
+        views: Vec<pdfcraft_annot::StandardView3d>,
     },
     /// Delete the comment at `index` in the page's `/Annots`, with its pop-up and replies.
     DeleteAnnotation {

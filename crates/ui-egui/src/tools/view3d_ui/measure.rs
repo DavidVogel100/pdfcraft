@@ -509,7 +509,7 @@ fn layer_controls(
             done |= (places.changed() && !places.dragged()) || places.drag_stopped();
         });
         if done {
-            edit = Some(pdfcraft_engine::Edit::SetModel3dLayers { page, index, layers: m.layers.clone() });
+            edit = Some(m.layers_edit(page, index, |_| {}));
         }
     }
     // The layer's view: the camera it opens on.
