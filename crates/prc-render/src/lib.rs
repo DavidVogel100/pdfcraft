@@ -12,6 +12,7 @@
 
 mod assemble;
 pub mod edges;
+pub mod export;
 pub mod measure;
 pub mod nav;
 mod outline;

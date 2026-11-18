@@ -441,6 +441,9 @@ fn a_hidden_mesh_is_not_drawn_and_a_highlighted_one_is_tinted() {
     assert_eq!(plain.mesh_at(40, 0), None, "off the image");
     let hidden = render_look(&meshes, &ortho(4.0), &small(), &Look { hidden: vec![true], ..Look::default() }).unwrap();
     assert_eq!(hidden.mesh_at(20, 20), Some(1), "with the near one hidden, the far one shows through");
+    // Moved well aside (an exploded view), the near one no longer covers the far one.
+    let moved = Look { offsets: Some(std::sync::Arc::from(vec![[100.0, 0.0, 0.0]])), ..Look::default() };
+    assert_eq!(render_look(&meshes, &ortho(4.0), &small(), &moved).unwrap().mesh_at(20, 20), Some(1), "moved aside");
     let lit = render_look(&meshes, &ortho(4.0), &small(), &Look { highlighted: vec![false, true], ..Look::default() }).unwrap();
     assert_eq!(pixel(&lit.image, 20, 20), pixel(&plain.image, 20, 20), "the unpicked square is unchanged");
     let [r, g, b, _] = pixel(&lit.image, 8, 8);
@@ -480,6 +483,7 @@ fn several_cores_pick_the_same_meshes_as_one() {
         highlighted: vec![false, false, true],
         section: Some(Section { normal: [1.0, 0.2, 0.0], offset: 0.4 }),
         outlines: Some(meshes.iter().map(|m| crate::outline_edges(&m.mesh)).collect()),
+        offsets: Some((0..12).map(|k| [0.0, f64::from(k) * 0.02, 0.0]).collect()),
     };
     let one = render_in(&meshes, &ortho(4.0), &small(), &look, Some(1)).unwrap();
     for workers in [2, 5] {

@@ -5,7 +5,7 @@
 
 use crate::WorldMesh;
 use crate::raster::{NO_ID, Target, View, ViewCorner, at, channel, pixel_index};
-use crate::vec3::{cross, dot, length, normalize, scale, span, sub, unit_cross};
+use crate::vec3::{add, cross, dot, length, normalize, scale, span, sub, unit_cross};
 use craft_prc::TriangleMesh;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
@@ -421,9 +421,16 @@ pub struct Look {
     /// Per mesh, the edges drawn over it in [`OUTLINE`] where nothing hides them (as
     /// [`crate::outline_edges`] finds them): its faces' borders, as CAD programs draw them.
     pub outlines: Option<std::sync::Arc<[Vec<[u32; 2]>]>>,
+    /// Per mesh, how far it is moved from where the model places it (an exploded view);
+    /// `None`, or a mesh past the end, is not moved.
+    pub offsets: Option<std::sync::Arc<[[f64; 3]]>>,
 }
 
 impl Look {
+    fn offset(&self, mesh: usize) -> [f64; 3] {
+        self.offsets.as_ref().and_then(|o| o.get(mesh).copied()).filter(|o| o.iter().all(|c| c.is_finite())).unwrap_or([0.0; 3])
+    }
+
     fn hidden(&self, mesh: usize) -> bool {
         self.hidden.get(mesh).copied().unwrap_or(false)
     }
@@ -577,7 +584,7 @@ fn render_in(
         for (k, m, t) in triangles(meshes, look, run) {
             let colour = colour_of(k, m, t);
             if colour[3] == 255 {
-                scene.draw(&mut target, &m.mesh, t, colour, id_of(k))?;
+                scene.draw(&mut target, &m.mesh, t, colour, id_of(k), look.offset(k))?;
             }
         }
         Ok(())
@@ -616,7 +623,7 @@ fn render_in(
             let mut target = Target { perspective, width, height, rgba, depth, ids, work: 0, pool: Some(&pool), rows };
             for (k, m) in shown() {
                 for t in (0..m.mesh.triangles.len()).filter(|&t| translucent(k, m, t)) {
-                    scene.draw(&mut target, &m.mesh, t, colour_of(k, m, t), id_of(k))?;
+                    scene.draw(&mut target, &m.mesh, t, colour_of(k, m, t), id_of(k), look.offset(k))?;
                 }
             }
             Ok(())
@@ -636,7 +643,7 @@ fn render_in(
                 let (lo, hi) = (run.start.saturating_sub(first).min(lines.len()), run.end.saturating_sub(first).min(lines.len()));
                 first += lines.len();
                 for &[a, b] in lines.get(lo..hi).unwrap_or(&[]) {
-                    scene.line(&m.mesh, [a, b], (width, height), depth, found);
+                    scene.line(&m.mesh, [a, b], look.offset(k), (width, height), depth, found);
                 }
             }
         };
@@ -768,8 +775,10 @@ impl Scene {
 
     /// The pixels of `mesh`'s edge between corners `a` and `b` that nothing nearer in `depth`
     /// hides, in a picture `size` big; pushed onto `out`.
-    fn line(&self, mesh: &TriangleMesh, [a, b]: [u32; 2], size: (u32, u32), depth: &[f64], out: &mut Vec<usize>) {
-        let corner = |i: u32| usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied()).filter(|p| p.iter().all(|c| c.is_finite()));
+    fn line(&self, mesh: &TriangleMesh, [a, b]: [u32; 2], offset: [f64; 3], size: (u32, u32), depth: &[f64], out: &mut Vec<usize>) {
+        let corner = |i: u32| {
+            usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied()).filter(|p| p.iter().all(|c| c.is_finite())).map(|p| add(p, offset))
+        };
         let (Some(pa), Some(pb)) = (corner(a), corner(b)) else { return };
         let [right, up, forward] = self.basis;
         let past = |p: [f64; 3]| self.section.map_or(0.0, |s| dot(s.normal, p) - s.offset);
@@ -802,10 +811,11 @@ impl Scene {
 
     /// Draw triangle `t` of `mesh` into `target` in straight-RGBA `colour`; refused once the
     /// target's work allowance is spent.
-    fn draw(&self, target: &mut Target, mesh: &TriangleMesh, t: usize, colour: [u8; 4], id: u32) -> Result<(), RenderError> {
+    fn draw(&self, target: &mut Target, mesh: &TriangleMesh, t: usize, colour: [u8; 4], id: u32, offset: [f64; 3]) -> Result<(), RenderError> {
         let Some(world) = mesh.triangles.get(t).and_then(|tri| corners(mesh, tri)) else {
             return Ok(());
         };
+        let world = world.map(|p| add(p, offset));
         let Some(face) = unit_cross(span(at3(&world, 0), at3(&world, 1)), span(at3(&world, 0), at3(&world, 2))) else {
             return Ok(());
         };

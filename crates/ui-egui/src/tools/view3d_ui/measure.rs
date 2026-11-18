@@ -201,6 +201,19 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
     if !view.models.values().any(|m| matches!(m.load, super::Load::Ready(_))) {
         return;
     }
+    if view.explode.apart() {
+        // Measurements are of parts where the model places them.
+        view.measuring = false;
+        view.dimensioning = false;
+        view.noting = false;
+        ui.horizontal(|ui| {
+            ui.add(crate::icons::image("ruler", 16.0, t.text_faint));
+            ui.label(egui::RichText::new(tl!("Turn Explode off to measure, dimension or write notes.")).color(t.text_muted));
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        return;
+    }
     let (was, was_dimensioning, was_noting) = (view.measuring, view.dimensioning, view.noting);
     ui.horizontal(|ui| {
         ui.add(crate::icons::image("ruler", 16.0, t.icon));

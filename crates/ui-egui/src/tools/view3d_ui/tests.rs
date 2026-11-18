@@ -717,3 +717,101 @@ fn view3d_write_acrobat_views() {
     let bytes = app.session.save_bytes(app.views[0].id).unwrap();
     std::fs::write(save, bytes.as_slice()).unwrap();
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): Explode ticked spreads the parts, and with moving parts on
+/// a drag moves the part under it; pictures into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_explode -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_explode() {
+    use egui_kittest::kittest::Queryable;
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.run_steps(5);
+    h.get_by_label("Explode").click();
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("e1-exploded.png")).unwrap();
+    assert!(h.state().views[0].view3d.models.get(&(0, 0)).unwrap().look.offsets.is_some());
+    h.get_by_label("Drag parts to move them").click();
+    h.run_steps(5);
+    let r = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().screen.unwrap();
+    // A part under the middle of the view, dragged down and left.
+    drag(&mut h, r.center(), egui::vec2(-150.0, 120.0), egui::Modifiers::NONE);
+    h.run_steps(30);
+    let moved = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().parts.moved.clone();
+    eprintln!("moved {moved:?}");
+    assert_eq!(moved.len(), 1, "one part moved by hand");
+    h.render().unwrap().save(out.join("e2-part-moved.png")).unwrap();
+}
+
+/// On a real 3D PDF (`VIEW3D_PDF`): the nozzle isolated and saved as STL and STEP, then the
+/// whole model as STEP, into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_export -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_export() {
+    use egui_kittest::kittest::Queryable;
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("Hypochlorous.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        let node = scene.nodes.iter().position(|n| n.name.starts_with("Fill Nozzle")).unwrap();
+        m.parts.isolated = Some(node);
+        m.parts.changed();
+    }
+    h.run_steps(10);
+    for (button, file) in [("STL…", "nozzle.stl"), ("STEP…", "nozzle.step")] {
+        h.state_mut().save_override = Some(out.join(file).to_string_lossy().into_owned());
+        h.get_by_label(button).click();
+        h.run_steps(10);
+        let len = std::fs::metadata(out.join(file)).map(|m| m.len()).unwrap_or(0);
+        eprintln!("{file}: {len} bytes");
+        assert!(len > 1000, "{file} written");
+    }
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        m.parts.isolated = None;
+        m.parts.changed();
+    }
+    h.run_steps(10);
+    // The whole model is too many facets for STEP: not written. As STL it is.
+    let _ = std::fs::remove_file(out.join("assembly.step"));
+    h.state_mut().save_override = Some(out.join("assembly.step").to_string_lossy().into_owned());
+    h.get_by_label("STEP…").click();
+    h.run_steps(10);
+    assert!(!out.join("assembly.step").exists(), "too big for STEP");
+    h.state_mut().save_override = Some(out.join("assembly.stl").to_string_lossy().into_owned());
+    h.get_by_label("STL…").click();
+    h.run_steps(10);
+    eprintln!("assembly.stl: {} bytes", std::fs::metadata(out.join("assembly.stl")).map(|m| m.len()).unwrap_or(0));
+}

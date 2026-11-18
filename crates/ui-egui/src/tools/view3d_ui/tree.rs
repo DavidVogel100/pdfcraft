@@ -31,6 +31,8 @@ pub(crate) struct Parts {
     pub(crate) scroll_to: Option<usize>,
     /// Bumped on every change, so the look is rebuilt and the model redrawn.
     pub(crate) rev: u64,
+    /// Parts moved by hand while taken apart: how far, in the world.
+    pub(crate) moved: std::collections::HashMap<usize, [f64; 3]>,
 }
 
 impl Parts {
@@ -75,6 +77,86 @@ impl Plane {
     }
 }
 
+/// Taking the model apart, shared by the document's models.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub(crate) struct ExplodeState {
+    pub(crate) on: bool,
+    /// How far apart, 0 (together) to 1.
+    pub(crate) amount: f32,
+    /// A drag on a part moves it, rather than turning the model.
+    pub(crate) move_parts: bool,
+}
+
+impl ExplodeState {
+    /// Whether the parts are not where the model places them.
+    pub(crate) fn apart(&self) -> bool {
+        self.on
+    }
+}
+
+/// How far each part is from its place: out from the middle of what is shown, by `amount`
+/// (at 1, as far again as it is from the middle), plus any move by hand.
+pub(crate) fn part_offsets(scene: &Scene, parts: &Parts, explode: &ExplodeState) -> Option<Vec<[f64; 3]>> {
+    if !explode.on {
+        return None;
+    }
+    // The middle of what is shown: the part isolated, else the whole model.
+    let root_centre = parts.isolated.and_then(|i| scene.centres.get(i).copied().flatten()).or_else(|| scene.bounds.map(|b| b.centre()))?;
+    let k = f64::from(explode.amount.clamp(0.0, 1.0));
+    Some(
+        scene
+            .mesh_nodes
+            .iter()
+            .map(|&node| {
+                let Some(node) = node else { return [0.0; 3] };
+                let centre = scene.centres.get(node).copied().flatten().unwrap_or(root_centre);
+                let by_hand = parts.moved.get(&node).copied().unwrap_or([0.0; 3]);
+                [0, 1, 2].map(|a| (centre[a] - root_centre[a]) * k + by_hand[a])
+            })
+            .collect(),
+    )
+}
+
+/// The explode controls, above the tree: on or off, how far apart, moving parts by hand.
+pub(crate) fn explode_controls(ui: &mut egui::Ui, t: &Tokens, view: &mut View3d) {
+    if !view.models.values().any(|m| matches!(m.load, Load::Ready(_))) {
+        return;
+    }
+    let before = view.explode;
+    let e = &mut view.explode;
+    ui.horizontal(|ui| {
+        ui.add(icons::image("move", 16.0, t.icon));
+        ui.add(crate::widgets::checkbox(&mut e.on, egui::RichText::new(tl!("Explode")).font(theme::medium(13.0))))
+            .on_hover_text(tl!("Take the assembly apart to see every part"));
+    });
+    if e.on {
+        ui.label(egui::RichText::new(tl!("How far apart")).color(t.text_muted).font(theme::regular(12.0)));
+        cut_slider(ui, t, &mut e.amount).on_hover_text(tl!("Drag to spread the parts out or bring them together"));
+        ui.horizontal(|ui| {
+            ui.add(crate::widgets::checkbox(&mut e.move_parts, tl!("Drag parts to move them")));
+            if ui.button(tl!("Put back")).on_hover_text(tl!("Every part back where the model places it")).clicked() {
+                for m in view.models.values_mut() {
+                    m.parts.moved.clear();
+                    m.parts.changed();
+                }
+            }
+        });
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    if view.explode != before {
+        if view.explode.on && !before.on && view.explode.amount == 0.0 {
+            view.explode.amount = 0.5;
+        }
+        if !view.explode.on {
+            view.explode.move_parts = false;
+        }
+        for m in view.models.values_mut() {
+            m.parts.changed();
+        }
+    }
+}
+
 /// The section view, shared by the document's models.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SectionState {
@@ -111,7 +193,7 @@ impl SectionState {
 }
 
 /// How `scene` is drawn given what the user did to its parts and the section view.
-pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>) -> Look {
+pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>, explode: &ExplodeState) -> Look {
     // Nodes come before the nodes under them, so one pass in order settles each from its parent.
     let n = scene.nodes.len();
     let (mut hidden, mut inside, mut picked) = (vec![false; n], vec![parts.isolated.is_none(); n], vec![false; n]);
@@ -127,6 +209,7 @@ pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>) ->
         highlighted: scene.mesh_nodes.iter().map(|&node| of(&picked, node, false)).collect(),
         section,
         outlines: Some(std::sync::Arc::clone(&scene.outlines)),
+        offsets: part_offsets(scene, parts, explode).map(std::sync::Arc::from),
     }
 }
 
@@ -252,11 +335,22 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
             });
         }
         let key = (model.page, model.index);
-        if parts.isolated.is_some()
-            && ui.button(tl!("Print part…")).on_hover_text(tl!("A sheet of this part with its dimensions and notes, to print or save")).clicked()
-        {
+        let (mut print, mut stl, mut step) = (false, false, false);
+        ui.horizontal(|ui| {
+            print = parts.isolated.is_some()
+                && ui.button(tl!("Print part…")).on_hover_text(tl!("A sheet of this part with its dimensions and notes, to print or save")).clicked();
+            stl = ui.button(tl!("STL…")).on_hover_text(tl!("Save what is shown as an STL file, for 3D printing")).clicked();
+            step = ui.button(tl!("STEP…")).on_hover_text(tl!("Save what is shown as a STEP file of facets, to open in a CAD program")).clicked();
+        });
+        if print {
             view.sheet_dialog = Some(key);
             view.sheet_error = None;
+        }
+        if stl || step {
+            match super::export::export(&scene, &m.look, parts.isolated, &view.file_name, step) {
+                Ok(file) => view.export = Some(Ok(file)),
+                Err(e) => view.export = Some(Err(e)),
+            }
         }
         if view.sheet_dialog == Some(key) {
             match sheet_dialog(ui.ctx(), &mut view.sheet_choice, view.sheet_error.as_deref()) {
@@ -606,15 +700,15 @@ mod tests {
     fn hiding_isolating_and_selecting_reach_the_meshes_under_a_node() {
         let s = scene();
         let mut parts = Parts::default();
-        assert_eq!(look_of(&s, &parts, None).hidden, [false, false, false]);
+        assert_eq!(look_of(&s, &parts, None, &ExplodeState::default()).hidden, [false, false, false]);
         parts.hidden.insert(2);
-        assert_eq!(look_of(&s, &parts, None).hidden, [true, true, false]);
+        assert_eq!(look_of(&s, &parts, None, &ExplodeState::default()).hidden, [true, true, false]);
         parts.hidden.clear();
         parts.isolated = Some(4);
-        assert_eq!(look_of(&s, &parts, None).hidden, [true, false, true]);
+        assert_eq!(look_of(&s, &parts, None, &ExplodeState::default()).hidden, [true, false, true]);
         parts.isolated = None;
         parts.select(&s, Some(2));
-        assert_eq!(look_of(&s, &parts, None).highlighted, [true, true, false]);
+        assert_eq!(look_of(&s, &parts, None, &ExplodeState::default()).highlighted, [true, true, false]);
         // Selecting opens the rows above it.
         assert!(parts.expanded.contains(&1) && parts.expanded.contains(&0));
     }

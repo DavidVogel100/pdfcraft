@@ -19,6 +19,7 @@ use crate::page_cursor::Layer;
 use crate::page_router::{Hit, Owner, PagePress};
 
 mod dims;
+mod export;
 mod measure;
 mod scene;
 mod sheet;
@@ -29,7 +30,7 @@ mod tree;
 
 pub(crate) use measure::measure_controls;
 use scene::Scene;
-pub(crate) use tree::{section_controls, tree_panel};
+pub(crate) use tree::{explode_controls, section_controls, tree_panel};
 
 /// The largest side drawn at rest, in pixels; while the model moves, half of what it would be.
 const MAX_SIDE: f32 = 1600.0;
@@ -54,6 +55,8 @@ pub(crate) struct View3d {
     wheel: f32,
     /// The section view, for every model of the document.
     section: tree::SectionState,
+    /// Taking the models apart.
+    explode: tree::ExplodeState,
     /// The Measure tool is on: a click on a model picks a face to measure, not a part.
     measuring: bool,
     /// Dimensioning is on: the part selected is isolated and what is measured can be kept on
@@ -71,6 +74,9 @@ pub(crate) struct View3d {
     sheet_choice: sheet::SheetChoice,
     sheet: Option<pdfcraft_engine::PartSheet>,
     sheet_error: Option<String>,
+    /// A file made from a model (its name and bytes), for the app to save.
+    /// Or why it could not be made.
+    export: Option<Result<(String, Vec<u8>), String>>,
     pub(crate) file_name: String,
 }
 
@@ -78,6 +84,11 @@ impl View3d {
     /// The edit made here since last asked, for the app to apply.
     pub(crate) fn take_edit(&mut self) -> Option<pdfcraft_engine::Edit> {
         self.edit.take()
+    }
+
+    /// The STL or STEP file made since last asked, for the app to save.
+    pub(crate) fn take_export(&mut self) -> Option<Result<(String, Vec<u8>), String>> {
+        self.export.take()
     }
 
     /// The part sheet made since last asked, for the app to open as a new document.
@@ -131,6 +142,8 @@ struct Model {
     dim_drag: Option<(usize, egui::Vec2)>,
     /// Where the active layer's dimension texts were drawn last frame (screen).
     dim_hits: Vec<(usize, Rect)>,
+    /// While taken apart: the part being moved by hand.
+    part_drag: Option<usize>,
     /// Where the measurement's labels were drawn last frame (screen), and the one being dragged.
     label_hits: Vec<(usize, Rect)>,
     label_drag: Option<usize>,
@@ -227,7 +240,9 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
         if whole { xf.rect } else { xf.user_rect(info, page, m.rect) }
     };
     let m = info.annots_3d.iter().rev().find(|m| m.page == page && area(m).contains(p) && view.ready(page, m.index))?;
-    let tip = if view.noting {
+    let tip = if view.explode.move_parts {
+        tl!("Drag a part to move it · Shift+drag to move the view · Wheel to zoom")
+    } else if view.noting {
         tl!("Click the part for a note pointing at it, or beside it for a note on the sheet")
     } else if view.measuring {
         tl!("Click a face to measure it, then another to measure between them")
@@ -263,8 +278,10 @@ pub(crate) fn page_input(
 ) -> bool {
     let PagePress::Mine(Owner::Model3d { index }) = press else { return false };
     let Some(m) = view.models.get_mut(&(page, index)) else { return false };
-    // Dimensioning with no part chosen yet: a click picks the part, not a face.
-    let measuring = view.measuring && !(view.dimensioning && m.active.is_none());
+    // Dimensioning with no part chosen yet: a click picks the part, not a face. Taken apart,
+    // a click picks a part.
+    let apart = view.explode.apart();
+    let measuring = view.measuring && !apart && !(view.dimensioning && m.active.is_none());
     let now = ui.input(|i| i.time);
     let height = f64::from(m.screen.map_or(400.0, |r| r.height()));
     // Shift as the key state says, or as this frame's press carried it: the key state can lag
@@ -279,13 +296,49 @@ pub(crate) fn page_input(
     }) {
         m.press_at = Some(at);
     }
+    // Taken apart, with moving parts on: a drag on a part moves it across the view.
+    if apart && view.explode.move_parts && ptr.drag_started {
+        m.part_drag = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).zip(Some(&m.load)).and_then(|(((p, r), f), load)| {
+            let Load::Ready(scene) = load else { return None };
+            let x = (p.x - r.left()) / r.width().max(1.0) * f.image.width as f32;
+            let y = (p.y - r.top()) / r.height().max(1.0) * f.image.height as f32;
+            // Inside the picture, so the casts are exact.
+            let mesh = (x >= 0.0 && y >= 0.0).then(|| f.mesh_at(x as u32, y as u32)).flatten()?;
+            scene.mesh_nodes.get(mesh).copied().flatten()
+        });
+    }
+    if let Some(node) = m.part_drag {
+        if let (Some(r), Some((drawn_with, size, _)), Load::Ready(scene)) = (m.screen, m.drawn, &m.load) {
+            let d = resp.drag_delta();
+            // Across the view at the part's depth: the world move one point of drag makes.
+            let centre = scene.centres.get(node).copied().flatten().unwrap_or(drawn_with.target);
+            let forward = scene::normalize(scene::sub(drawn_with.target, drawn_with.eye)).unwrap_or([0.0, 0.0, -1.0]);
+            let depth = scene::dot(scene::sub(centre, drawn_with.eye), forward);
+            let px = f64::from(size[0]) / f64::from(r.width().max(1.0));
+            let (cx, cy) = (f64::from(size[0]) / 2.0, f64::from(size[1]) / 2.0);
+            let at = |x: f64, y: f64| drawn_with.unproject(x, y, size[0], size[1], depth);
+            if let (Some(a), Some(b)) = (at(cx, cy), at(cx + f64::from(d.x) * px, cy + f64::from(d.y) * px)) {
+                let step = scene::sub(b, a);
+                let slot = m.parts.moved.entry(node).or_insert([0.0; 3]);
+                *slot = scene::add(*slot, step);
+                m.parts.changed();
+            }
+        }
+        if !resp.dragged() || resp.drag_stopped() {
+            m.part_drag = None;
+        }
+        m.moving_until = now + SETTLE;
+        cursor.claim(Layer::Drag, egui::CursorIcon::Move);
+        ui.ctx().request_repaint();
+        return true;
+    }
     // What a turn falls back to: the middle of the model, never a point off the screen.
     let middle = match &m.load {
         Load::Ready(scene) => scene.bounds.map(|b| b.centre()),
         _ => None,
     };
     let Some(camera) = m.camera.as_mut() else { return true };
-    if view.noting && m.active.is_some() {
+    if view.noting && !apart && m.active.is_some() {
         return notes_input(ui, resp, ptr, m, (page, index), &mut view.edit, cursor);
     }
     // A measurement's label: dragged away from what it measures, a leader pointing back.
@@ -568,6 +621,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             dim_hits: Vec::new(),
             label_hits: Vec::new(),
             label_drag: None,
+            part_drag: None,
             dims_node: None,
             want_part: None,
             note_picked: None,
@@ -669,7 +723,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         // At most MAX_SIDE a side, so the casts are exact.
         let size = [(r.width() * scale).round().max(1.0) as u32, (r.height() * scale).round().max(1.0) as u32];
         if m.look_rev != Some(m.parts.rev) {
-            m.look = tree::look_of(&scene, &m.parts, view.section.section(bounds.min, bounds.max));
+            m.look = tree::look_of(&scene, &m.parts, view.section.section(bounds.min, bounds.max), &view.explode);
             m.look_rev = Some(m.parts.rev);
         }
         if m.drawn != Some((camera, size, m.parts.rev)) {

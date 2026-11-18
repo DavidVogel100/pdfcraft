@@ -27,9 +27,34 @@ pub(crate) struct Scene {
     pub(crate) outlines: std::sync::Arc<[Vec<[u32; 2]>]>,
     /// The model's unit, when the file says what it is.
     pub(crate) units: Option<craft_prc::ModelUnits>,
+    /// Per node, the middle of what it draws (with the nodes under it); `None` when nothing.
+    pub(crate) centres: Vec<Option<[f64; 3]>>,
     /// Per mesh, the matrix that placed it (world = matrix × its own coordinates): a part's
     /// own coordinates, the same for every copy of it.
     pub(crate) placed_by: Vec<Option<[[f64; 4]; 4]>>,
+}
+
+/// Per node, the middle of the box around its meshes and those of the nodes under it.
+fn centres(nodes: &[Node], meshes: &[WorldMesh]) -> Vec<Option<[f64; 3]>> {
+    let mut boxes: Vec<Option<([f64; 3], [f64; 3])>> = nodes
+        .iter()
+        .map(|n| {
+            n.meshes.iter().filter_map(|&k| meshes.get(k)).flat_map(|m| m.mesh.positions.iter()).filter(|p| p.iter().all(|c| c.is_finite())).fold(
+                None,
+                |acc: Option<([f64; 3], [f64; 3])>, p| {
+                    Some(acc.map_or((*p, *p), |(lo, hi)| ([0, 1, 2].map(|a| lo[a].min(p[a])), [0, 1, 2].map(|a| hi[a].max(p[a])))))
+                },
+            )
+        })
+        .collect();
+    // Children come after their parents: from the end, each box joins its parent's.
+    for k in (0..nodes.len()).rev() {
+        let (Some(b), Some(p)) = (boxes.get(k).copied().flatten(), nodes.get(k).and_then(|n| n.parent).filter(|&p| p < k)) else { continue };
+        if let Some(slot) = boxes.get_mut(p) {
+            *slot = Some(slot.map_or(b, |(lo, hi)| ([0, 1, 2].map(|a| lo[a].min(b.0[a])), [0, 1, 2].map(|a| hi[a].max(b.1[a])))));
+        }
+    }
+    boxes.into_iter().map(|b| b.map(|(lo, hi)| [0, 1, 2].map(|a| (lo[a] + hi[a]) / 2.0))).collect()
 }
 
 impl Scene {
@@ -66,7 +91,8 @@ impl Scene {
         let outlines = meshes.iter().map(|m| pdfcraft_prc_render::outline_edges(&m.mesh)).collect();
         let placements = prc.placements().unwrap_or_default();
         let placed_by = meshes.iter().map(|m| m.placement.and_then(|p| placements.get(p)).map(|p| p.matrix.0)).collect();
-        Ok(Scene { meshes, nodes, mesh_nodes, bounds, outlines, units, placed_by })
+        let centres = centres(&nodes, &meshes);
+        Ok(Scene { meshes, nodes, mesh_nodes, bounds, outlines, units, placed_by, centres })
     }
 
     /// The nodes with no parent.

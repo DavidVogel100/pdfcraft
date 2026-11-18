@@ -171,6 +171,31 @@ impl PdfCraftApp {
         }
     }
 
+    /// Save a file made from a 3D model (STL or STEP), asked where (`save_override` in tests).
+    pub(crate) fn save_model_export(&mut self, name: String, bytes: Vec<u8>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let write = move |app: &mut Self, path: std::path::PathBuf| match crate::editing::write_atomically(&path.to_string_lossy(), &bytes) {
+                Ok(()) => app.notify_fmt("Exported to {path}", &[("path", &path.display().to_string())]),
+                Err(e) => app.notify_fmt("Couldn't write {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]),
+            };
+            match self.save_override.clone() {
+                Some(p) => write(self, p.into()),
+                None => {
+                    let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+                    let (label, exts): (&str, &[&str]) = if ext == "stl" { ("STL", &["stl"]) } else { ("STEP", &["step", "stp"]) };
+                    let dialog =
+                        rfd::AsyncFileDialog::new().set_title(tl!("Export the 3D model").to_string()).add_filter(label, exts).set_file_name(name);
+                    self.ask_one(crate::pickers::Ask::Save(dialog), None, write);
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Err(e) = crate::editing::download(&name, &bytes) {
+            self.notify_error(e);
+        }
+    }
+
     /// Save the area `view_rect` of `page` that view `index` copied as a PNG file (asked where;
     /// `save_override` in tests). The last snapshot is used when it was taken of that area;
     /// otherwise (another tab snapshotted since) the area is rendered again.
