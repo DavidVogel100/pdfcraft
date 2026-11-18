@@ -504,7 +504,7 @@ fn view3d_dimension_layer() {
     let annot = d(&cos.resolve(page.get(b"Annots").unwrap()).as_array().unwrap()[0]);
     let stream = cos.resolve(annot.get(b"3DD").unwrap());
     let pdfcraft_cos::Object::Stream(stream) = stream.as_ref() else { panic!("a 3D stream") };
-    let views: Vec<_> = cos.resolve(stream.dict.get(b"VA").unwrap()).as_array().unwrap().iter().map(|v| d(v)).collect();
+    let views: Vec<_> = cos.resolve(stream.dict.get(b"VA").unwrap()).as_array().unwrap().iter().map(&d).collect();
     eprintln!("{} views", views.len());
     let ours: Vec<_> = views.iter().filter(|v| v.get(b"PCft3DView").is_some()).collect();
     assert_eq!(ours.len(), 1, "an Acrobat view for the layer");
@@ -680,4 +680,40 @@ fn view3d_part_sheet() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     h.render().unwrap().save(out.join("s2-sheet.png")).unwrap();
+}
+
+/// A 3D PDF's layers (`VIEW3D_PDF`) written again with their Acrobat views, into `VIEW3D_SAVE`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_write_acrobat_views -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_write_acrobat_views() {
+    let (Some(pdf), Some(save)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_SAVE")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.run_steps(5);
+    let edit = {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        eprintln!("{} layers", m.layers.len());
+        m.layers_edit(0, 0, |_| {})
+    };
+    if let pdfcraft_engine::Edit::SetModel3dLayers { views, .. } = &edit {
+        for v in views {
+            eprintln!("view {:?}: {} measurements", v.name, v.measures.len());
+        }
+    }
+    let app = h.state_mut();
+    assert!(app.apply_edit(edit));
+    let bytes = app.session.save_bytes(app.views[0].id).unwrap();
+    std::fs::write(save, bytes.as_slice()).unwrap();
 }

@@ -1,11 +1,13 @@
 //! The layers again as Acrobat reads them: one 3D view per layer in the 3D stream's `/VA`,
 //! turned to the layer's view and with the other parts hidden, and its dimensions and notes as
 //! 3D measurement dictionaries in the view's `/MA` (Adobe Supplement to ISO 32000, ExtensionLevel
-//! 3, §9.5.6: `LD3` linear, `RD3` radial, `3DC` comment). The views written are marked with
-//! `/PCft3DView` and replaced on every change; the file's own views stay as they were.
+//! 3, §9.5.6: `LD3` linear, `RD3` radial, `3DC` comment). As Acrobat writes its own, each
+//! measurement is an object of its own tied (`/S`, `/ExData /M3DREF`) to a Projection annotation
+//! on the page, which carries it in the comment list. What is written here is marked with
+//! `/PCft3DView` and replaced on every change; the file's own views and comments stay.
 
-use super::super::lookup::{annots, page_ref};
-use super::super::{AnnotError, Dict, Document, Object, PdfString};
+use super::super::lookup::{annots, page_ref, set_annots};
+use super::super::{AnnotError, Dict, Document, ObjRef, Object, PdfString};
 
 /// Marks a view this module wrote.
 const MARK: &[u8] = b"PCft3DView";
@@ -54,9 +56,10 @@ fn unit(a: [f64; 3]) -> Option<[f64; 3]> {
     (l > 0.0 && l.is_finite()).then(|| a.map(|v| v / l))
 }
 
-/// The view's dictionary: `/C2W` with z ahead, y up and x = z × y (as the 3D view reader reads
-/// it), `/CO` the distance to the target.
-fn view_dict(v: &StandardView3d) -> Option<Dict> {
+/// The view's dictionary (its measurements to add as `/MA`), and the plane, across and up
+/// directions its markup is written in: `/C2W` with z ahead, y up and x = z × y (as the 3D view
+/// reader reads it), `/CO` the distance to the target.
+fn view_dict(v: &StandardView3d) -> Option<(Dict, [[f64; 3]; 3])> {
     let ahead = unit(sub(v.target, v.eye))?;
     let right = unit(cross(ahead, v.up))?;
     let up = cross(right, ahead);
@@ -101,12 +104,45 @@ fn view_dict(v: &StandardView3d) -> Option<Dict> {
             .collect();
         view.set(b"NA".to_vec(), Object::Array(nodes));
     }
-    // Text faces the camera: across is right, up is up; the markup lies square to the view.
-    let plane = ahead.map(|v| -v);
-    let measures = v.measures.iter().map(|m| Object::Dict(measure_dict(m, plane, right, up))).collect();
-    view.set(b"MA".to_vec(), Object::Array(measures));
     view.set(MARK.to_vec(), Object::Bool(true));
-    Some(view)
+    // Text faces the camera: across is right, up is up; the markup lies square to the view.
+    Some((view, [ahead.map(|v| -v), right, up]))
+}
+
+/// A colour as Acrobat writes a measurement's: with its colour space.
+fn colour(c: [f64; 3]) -> Object {
+    let mut a = vec![Object::name("DeviceRGB")];
+    a.extend(c.iter().map(|&v| Object::Real(v)));
+    Object::Array(a)
+}
+
+/// What a measurement says, for its comment.
+fn said(m: &StandardMeasure3d) -> &str {
+    match m {
+        StandardMeasure3d::Linear { label, .. } | StandardMeasure3d::Radial { label, .. } => label,
+        StandardMeasure3d::Comment { text, .. } => text,
+    }
+}
+
+/// The Projection annotation carrying measurement `measure` on `page` in the comment list.
+fn projection(page: ObjRef, measure: ObjRef, text: &str, k: usize) -> Dict {
+    let mut ex = Dict::new();
+    ex.set(b"Type".to_vec(), Object::name("ExData"));
+    ex.set(b"Subtype".to_vec(), Object::name("3DM"));
+    ex.set(b"M3DREF".to_vec(), Object::Ref(measure));
+    let mut a = Dict::new();
+    a.set(b"Type".to_vec(), Object::name("Annot"));
+    a.set(b"Subtype".to_vec(), Object::name("Projection"));
+    a.set(b"Rect".to_vec(), numbers(&[0.0; 4]));
+    a.set(b"F".to_vec(), Object::Int(4));
+    a.set(b"P".to_vec(), Object::Ref(page));
+    a.set(b"Contents".to_vec(), PdfString::text(text));
+    a.set(b"NM".to_vec(), PdfString::text(&format!("pdfcraft-3d-{}-{k}", measure.num)));
+    a.set(b"T".to_vec(), PdfString::text("pdfcraft"));
+    a.set(b"C".to_vec(), numbers(&[0.86, 0.2, 0.15]));
+    a.set(b"ExData".to_vec(), Object::Dict(ex));
+    a.set(MARK.to_vec(), Object::Bool(true));
+    a
 }
 
 fn measure_dict(m: &StandardMeasure3d, plane: [f64; 3], across: [f64; 3], up: [f64; 3]) -> Dict {
@@ -115,8 +151,8 @@ fn measure_dict(m: &StandardMeasure3d, plane: [f64; 3], across: [f64; 3], up: [f
     d.set(b"AP".to_vec(), numbers(&plane));
     d.set(b"TX".to_vec(), numbers(&across));
     d.set(b"TY".to_vec(), numbers(&up));
-    d.set(b"TS".to_vec(), Object::Real(12.0));
-    d.set(b"C".to_vec(), numbers(&[0.05, 0.05, 0.08]));
+    d.set(b"TS".to_vec(), Object::Real(16.0));
+    d.set(b"C".to_vec(), colour([0.0, 0.0, 0.0]));
     let value = |d: &mut Dict, value: f64, units: &str, places: u8, after: &str, label: &str| {
         d.set(b"V".to_vec(), Object::Real(value));
         d.set(b"U".to_vec(), PdfString::text(units));
@@ -144,10 +180,16 @@ fn measure_dict(m: &StandardMeasure3d, plane: [f64; 3], across: [f64; 3], up: [f
             value(&mut d, *v, units, *places, after, label);
         }
         StandardMeasure3d::Comment { anchor, text_at, text } => {
+            // Acrobat keeps a comment's text after the value (`/UT`), its box in characters and
+            // lines (`/TB`).
             d.set(b"Subtype".to_vec(), Object::name("3DC"));
             d.set(b"A1".to_vec(), numbers(anchor));
             d.set(b"TP".to_vec(), numbers(text_at));
-            d.set(b"TRL".to_vec(), PdfString::text(text));
+            d.set(b"UT".to_vec(), PdfString::text(text));
+            d.set(b"TRL".to_vec(), PdfString::text(text.lines().next().unwrap_or_default()));
+            let columns = text.lines().map(|l| l.chars().count()).max().unwrap_or(1).clamp(1, 60);
+            let rows = text.lines().count().max(1);
+            d.set(b"TB".to_vec(), Object::Array(vec![Object::Int(columns as i64), Object::Int(rows as i64)]));
         }
     }
     d
@@ -169,7 +211,8 @@ fn signed(doc: &Document) -> bool {
 /// When there is no such page or annotation. A model with no 3D stream of its own to hold views
 /// is left as it is.
 pub fn set_standard_views(doc: &mut Document, page: usize, index: usize, views: &[StandardView3d]) -> Result<(), AnnotError> {
-    let list = annots(doc, page_ref(doc, page)?);
+    let page_obj = page_ref(doc, page)?;
+    let list = annots(doc, page_obj);
     let entry = list.get(index).ok_or(AnnotError::NoSuchAnnotation { page, index })?;
     let annot = doc.dict(entry).ok_or(AnnotError::NoSuchAnnotation { page, index })?;
     // The 3D stream, directly or through a 3D reference dictionary; only an object of its own.
@@ -191,12 +234,28 @@ pub fn set_standard_views(doc: &mut Document, page: usize, index: usize, views: 
     if va_ref.is_none() && views.is_empty() {
         return Ok(());
     }
-    // The file's own views stay; those written before go.
-    items.retain(|o| !doc.resolve(o).as_dict().is_some_and(|d| d.get(MARK).is_some()));
+    // The file's own views and comments stay; those written before go.
+    let ours = |doc: &Document, o: &Object| doc.resolve(o).as_dict().is_some_and(|d| d.get(MARK).is_some());
+    items.retain(|o| !ours(doc, o));
+    let mut list: Vec<Object> = list.iter().filter(|o| !ours(doc, o)).cloned().collect();
+    let had = annots(doc, page_obj).len();
+    let mut k = 0;
     for v in views {
-        if let Some(d) = view_dict(v) {
-            items.push(Object::Ref(doc.add(Object::Dict(d))));
+        let Some((mut d, [plane, across, up])) = view_dict(v) else { continue };
+        let mut ma = Vec::new();
+        for m in &v.measures {
+            let measure = doc.add(Object::Dict(measure_dict(m, plane, across, up)));
+            let comment = doc.add(Object::Dict(projection(page_obj, measure, said(m), k)));
+            k += 1;
+            doc.update_dict(measure, |d| d.set(b"S".to_vec(), Object::Ref(comment))).map_err(|e| AnnotError::Invalid(e.to_string()))?;
+            list.push(Object::Ref(comment));
+            ma.push(Object::Ref(measure));
         }
+        d.set(b"MA".to_vec(), Object::Ref(doc.add(Object::Array(ma))));
+        items.push(Object::Ref(doc.add(Object::Dict(d))));
+    }
+    if list.len() != had || k > 0 {
+        set_annots(doc, page_obj, list).map_err(|e| AnnotError::Invalid(e.to_string()))?;
     }
     match va_ref {
         Some(r) => doc.set_existing(r, Object::Array(items)).map_err(|e| AnnotError::Invalid(e.to_string()))?,

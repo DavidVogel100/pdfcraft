@@ -233,13 +233,21 @@ fn layers_are_written_as_views_acrobat_shows_and_replaced_on_every_change() {
     };
     let v = views(&d);
     assert_eq!(v.len(), 2, "the file's own view kept, one added");
-    assert_eq!(v[1].get(b"MA").and_then(Object::as_array).map(Vec::len), Some(3));
-    assert_eq!(v[1].get(b"MA").and_then(Object::as_array).and_then(|a| a[0].as_dict()).and_then(|m| m.name(b"Subtype")), Some(&b"LD3"[..]));
+    let ma = d.resolve(v[1].get(b"MA").unwrap()).as_array().cloned().unwrap();
+    assert_eq!(ma.len(), 3);
+    let first = d.resolve(&ma[0]).as_dict().cloned().unwrap();
+    assert_eq!(first.name(b"Subtype"), Some(&b"LD3"[..]));
+    // Each tied to a Projection annotation on the page, as Acrobat ties its own.
+    let comment = d.get(first.reference(b"S").unwrap()).as_dict().cloned().unwrap();
+    assert_eq!(comment.name(b"Subtype"), Some(&b"Projection"[..]));
+    assert_eq!(annots(&d, page_ref(&d, 0).unwrap()).len(), 4, "the model and three comments");
     // Written again: replaced, not added to; none: only the file's own.
     set_standard_views(&mut d, 0, 0, &[view.clone(), view]).unwrap();
     assert_eq!(views(&d).len(), 3);
+    assert_eq!(annots(&d, page_ref(&d, 0).unwrap()).len(), 7, "replaced, not added to");
     set_standard_views(&mut d, 0, 0, &[]).unwrap();
     assert_eq!(views(&d).len(), 1);
+    assert_eq!(annots(&d, page_ref(&d, 0).unwrap()).len(), 1, "only the model again");
     // Read back by the 3D view reader as the camera it was.
     let bytes = pdfcraft_cos::write_incremental(&d, &pdfcraft_cos::SaveOptions::default()).unwrap();
     assert!(Document::open(Arc::new(bytes)).is_ok());
