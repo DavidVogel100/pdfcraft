@@ -158,6 +158,15 @@ fn dimension_layers_are_kept_on_the_annotation_and_read_back() {
             places: 3,
             exact: true,
         }],
+        notes: vec![
+            Note3d {
+                text: "Break all edges
+Deburr"
+                    .into(),
+                place: NotePlace3d::Sheet { at: [0.05, 0.9] },
+            },
+            Note3d { text: "Tap 10-32".into(), place: NotePlace3d::Leader { anchor: [0.0; 3], text_at: [0.5, 0.2, 0.0] } },
+        ],
     };
     set_model_3d_layers(&mut d, 0, 0, std::slice::from_ref(&layer)).unwrap();
     assert_eq!(model_3d_layers(&d, 0, 0).unwrap(), [layer]);

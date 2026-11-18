@@ -83,6 +83,28 @@ pub struct Dim3d {
     pub exact: bool,
 }
 
+/// Where a note sits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NotePlace3d {
+    /// On the part: a leader from the note's text at `text_at` to `anchor`, both in the
+    /// part's coordinates, so it turns with the part.
+    Leader { anchor: [f64; 3], text_at: [f64; 3] },
+    /// On the sheet: its top left at `at`, a share (0 to 1) of the view's width and height, so
+    /// it stays put while the part turns.
+    Sheet { at: [f64; 2] },
+}
+
+/// A note on a part.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note3d {
+    pub text: String,
+    pub place: NotePlace3d,
+}
+
+/// The most notes on one layer read back from a file, and the longest note's text.
+pub const MAX_NOTES: usize = 1000;
+pub const MAX_NOTE_CHARS: usize = 10_000;
+
 /// A layer of dimensions or notes on one part.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Layer3d {
@@ -92,6 +114,7 @@ pub struct Layer3d {
     pub name: String,
     pub view: Option<LayerView3d>,
     pub dims: Vec<Dim3d>,
+    pub notes: Vec<Note3d>,
 }
 
 /// The layers kept on the 3D annotation at `/Annots` position `index` on 0-based `page`; none
@@ -187,6 +210,23 @@ fn write_layer(l: &Layer3d) -> Object {
         })
         .collect();
     d.set(b"Dims".to_vec(), Object::Array(dims));
+    let notes = l
+        .notes
+        .iter()
+        .map(|n| {
+            let mut x = Dict::new();
+            x.set(b"T".to_vec(), PdfString::text(&n.text));
+            match n.place {
+                NotePlace3d::Leader { anchor, text_at } => {
+                    x.set(b"A".to_vec(), numbers(&anchor));
+                    x.set(b"P".to_vec(), numbers(&text_at));
+                }
+                NotePlace3d::Sheet { at } => x.set(b"S".to_vec(), numbers(&at)),
+            }
+            Object::Dict(x)
+        })
+        .collect();
+    d.set(b"Notes".to_vec(), Object::Array(notes));
     Object::Dict(d)
 }
 
@@ -254,5 +294,26 @@ fn read_layer(doc: &Document, o: &Object) -> Option<Layer3d> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(Layer3d { part: text(doc, d.get(b"Part"))?, kind, name: text(doc, d.get(b"Name")).unwrap_or_default(), view, dims })
+    let notes = d.get(b"Notes").map(|x| doc.resolve(x));
+    let notes = notes
+        .as_deref()
+        .and_then(Object::as_array)
+        .map(|list| {
+            list.iter()
+                .take(MAX_NOTES)
+                .filter_map(|n| {
+                    let n = doc.resolve(n);
+                    let n = n.as_dict()?;
+                    let text: String = text(doc, n.get(b"T"))?.chars().take(MAX_NOTE_CHARS).collect();
+                    let place = match (point(doc, n.get(b"A")), point(doc, n.get(b"P")), read_numbers(doc, n.get(b"S")).as_deref()) {
+                        (Some(anchor), Some(text_at), _) => NotePlace3d::Leader { anchor, text_at },
+                        (_, _, Some(&[x, y])) => NotePlace3d::Sheet { at: [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)] },
+                        _ => return None,
+                    };
+                    Some(Note3d { text, place })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Layer3d { part: text(doc, d.get(b"Part"))?, kind, name: text(doc, d.get(b"Name")).unwrap_or_default(), view, dims, notes })
 }

@@ -118,7 +118,10 @@ fn stream_of(doc: &Document, annot: &Dict) -> Option<std::sync::Arc<Object>> {
 }
 
 mod layers;
-pub use layers::{Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, MAX_DIMENSIONS, MAX_LAYERS, model_3d_layers, set_model_3d_layers};
+pub use layers::{
+    Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, MAX_DIMENSIONS, MAX_LAYERS, MAX_NOTE_CHARS, MAX_NOTES, Note3d, NotePlace3d, model_3d_layers,
+    set_model_3d_layers,
+};
 
 #[cfg(test)]
 mod tests;

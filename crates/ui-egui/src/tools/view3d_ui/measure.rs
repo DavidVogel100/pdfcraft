@@ -201,14 +201,29 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
     if !view.models.values().any(|m| matches!(m.load, super::Load::Ready(_))) {
         return;
     }
-    let (was, was_dimensioning) = (view.measuring, view.dimensioning);
+    let (was, was_dimensioning, was_noting) = (view.measuring, view.dimensioning, view.noting);
     ui.horizontal(|ui| {
         ui.add(crate::icons::image("ruler", 16.0, t.icon));
         ui.add(crate::widgets::checkbox(&mut view.measuring, egui::RichText::new(tl!("Measure")).font(crate::theme::medium(13.0))));
         ui.add_space(12.0);
         ui.add(crate::widgets::checkbox(&mut view.dimensioning, egui::RichText::new(tl!("Dimension")).font(crate::theme::medium(13.0))))
             .on_hover_text(tl!("Keep measurements on the selected part as dimensions, saved in the PDF"));
+        ui.add_space(12.0);
+        ui.add(crate::widgets::checkbox(&mut view.noting, egui::RichText::new(tl!("Note")).font(crate::theme::medium(13.0))))
+            .on_hover_text(tl!("Write notes on the selected part, saved in the PDF"));
     });
+    // Noting and measuring take turns: a click either adds a note or measures.
+    if view.noting && !was_noting {
+        view.measuring = false;
+        view.dimensioning = false;
+        for m in view.models.values_mut() {
+            m.dims_node = None;
+            m.measure.clear();
+        }
+    }
+    if (view.measuring && !was) || (view.dimensioning && !was_dimensioning) {
+        view.noting = false;
+    }
     if view.dimensioning && !was_dimensioning {
         view.measuring = true;
         for m in view.models.values_mut() {
@@ -292,8 +307,141 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
             ui.label(egui::RichText::new(tl!("Click a face of the model to measure it.")).color(t.text_muted));
         }
     }
+    if view.noting {
+        let mut edit = None;
+        for model in &info.annots_3d {
+            let Some(m) = view.models.get_mut(&(model.page, model.index)) else { continue };
+            let super::Load::Ready(scene) = &m.load else { continue };
+            let scene = std::sync::Arc::clone(scene);
+            if m.active.is_none() {
+                ui.label(egui::RichText::new(tl!("Click a part, in the picture or the tree, to write notes on it.")).color(t.text_muted));
+                continue;
+            }
+            if let Some(e) = notes_controls(ui, t, m, &scene, (model.page, model.index)) {
+                edit = Some(e);
+            }
+        }
+        if edit.is_some() {
+            view.edit = edit;
+        }
+    }
     ui.add_space(4.0);
     ui.separator();
+}
+
+/// The notes layer being worked on: the note being written, its notes (one picked to change its
+/// text or delete it) and its saved view. The edit made.
+fn notes_controls(
+    ui: &mut egui::Ui,
+    t: &crate::theme::Tokens,
+    m: &mut super::Model,
+    scene: &super::Scene,
+    (page, index): (usize, usize),
+) -> Option<pdfcraft_engine::Edit> {
+    let active = m.active?;
+    let layer = m.layers.get(active)?;
+    let copies = super::dims::copies(scene, &layer.part);
+    ui.add_space(6.0);
+    let title = crate::i18n::fmt(tl!("Notes on {part}"), &[("part", &layer.part)]);
+    ui.label(egui::RichText::new(title).font(crate::theme::semibold(13.0)));
+    if copies > 1 {
+        let shared = crate::i18n::fmt(tl!("Shared by all {n} copies"), &[("n", &copies.to_string())]);
+        ui.label(egui::RichText::new(shared).color(t.text_muted).font(crate::theme::regular(12.0)));
+    }
+    let mut edit = None;
+    // The note being written.
+    if let Some((place, text)) = m.note_draft.as_mut() {
+        let leader = matches!(place, pdfcraft_engine::NotePlace3d::Leader { .. });
+        ui.label(egui::RichText::new(if leader { tl!("New note on the part") } else { tl!("New note on the sheet") }).color(t.text_muted));
+        let field = ui.add(crate::widgets::block(text).desired_rows(3).desired_width(f32::INFINITY).id_salt("view3d-new-note"));
+        if !field.has_focus() && text.is_empty() {
+            field.request_focus();
+        }
+        let (mut add, mut cancel) = (false, false);
+        ui.horizontal(|ui| {
+            add = ui.add_enabled(!text.trim().is_empty(), egui::Button::new(tl!("Add note"))).clicked();
+            cancel = ui.button(tl!("Cancel")).clicked();
+        });
+        if add {
+            let note = pdfcraft_engine::Note3d { text: text.trim_end().to_owned(), place: *place };
+            m.note_draft = None;
+            edit = Some(m.layers_edit(page, index, |l| {
+                if let Some(layer) = l.get_mut(active) {
+                    layer.notes.push(note);
+                }
+            }));
+            m.note_picked = m.layers.get(active).and_then(|l| l.notes.len().checked_sub(1));
+        } else if cancel {
+            m.note_draft = None;
+        }
+    } else {
+        ui.label(egui::RichText::new(tl!("Click the part for a note pointing at it, or beside it for a note on the sheet.")).color(t.text_muted));
+    }
+    let notes: Vec<String> =
+        m.layers.get(active).map(|l| l.notes.iter().map(|n| n.text.lines().next().unwrap_or_default().to_owned()).collect()).unwrap_or_default();
+    let mut delete = None;
+    for (k, first_line) in notes.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let shown =
+                if first_line.chars().count() > 34 { format!("{}…", first_line.chars().take(33).collect::<String>()) } else { first_line.clone() };
+            if ui.selectable_label(m.note_picked == Some(k), shown).clicked() {
+                m.note_picked = if m.note_picked == Some(k) { None } else { Some(k) };
+                m.note_text = m.note_picked.and_then(|p| m.layers.get(active)?.notes.get(p).map(|n| (p, n.text.clone())));
+            }
+            if crate::icons::button(ui, "x", 20.0, false, tl!("Delete this note")).clicked() {
+                delete = Some(k);
+            }
+        });
+    }
+    if let Some(k) = delete {
+        m.note_picked = None;
+        m.note_text = None;
+        return Some(m.layers_edit(page, index, |l| {
+            if let Some(layer) = l.get_mut(active)
+                && k < layer.notes.len()
+            {
+                layer.notes.remove(k);
+            }
+        }));
+    }
+    // The picked note's text, changed in place and kept with Save.
+    if let Some(k) = m.note_picked {
+        if m.note_text.as_ref().is_none_or(|(n, _)| *n != k) {
+            m.note_text = m.layers.get(active).and_then(|l| l.notes.get(k)).map(|n| (k, n.text.clone()));
+        }
+        if let Some((_, text)) = m.note_text.as_mut() {
+            ui.add(crate::widgets::block(text).desired_rows(3).desired_width(f32::INFINITY).id_salt(("view3d-note", k)));
+            let changed = m.layers.get(active).and_then(|l| l.notes.get(k)).is_some_and(|n| n.text != *text);
+            if ui.add_enabled(changed && !text.trim().is_empty(), egui::Button::new(tl!("Save note"))).clicked() {
+                let text = text.trim_end().to_owned();
+                edit = Some(m.layers_edit(page, index, |l| {
+                    if let Some(note) = l.get_mut(active).and_then(|layer| layer.notes.get_mut(k)) {
+                        note.text = text;
+                    }
+                }));
+            }
+        }
+    }
+    // The layer's view, as for dimensions.
+    let frame = m.isolated_frame(scene).map(|(_, f)| f);
+    let saved = m.layers.get(active).and_then(|l| l.view);
+    let (mut go, mut save) = (false, false);
+    ui.horizontal(|ui| {
+        go = saved.is_some() && ui.button(tl!("Go to saved view")).clicked();
+        save = ui.button(tl!("Save this view")).on_hover_text(tl!("The layer opens on the view as it is now")).clicked();
+    });
+    if let (true, Some(v), Some(f)) = (go, saved, frame) {
+        m.camera = Some(f.camera(&v));
+    }
+    if let (true, Some(c), Some(f)) = (save, m.camera, frame) {
+        let v = f.save_view(&c);
+        edit = Some(m.layers_edit(page, index, |l| {
+            if let Some(layer) = l.get_mut(active) {
+                layer.view = Some(v);
+            }
+        }));
+    }
+    edit
 }
 
 /// The dimension layer being worked on: its dimensions (one picked to set its tolerance or

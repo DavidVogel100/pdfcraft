@@ -4,7 +4,7 @@
 //! shown only while its part is isolated.
 
 use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, pos2, vec2};
-use pdfcraft_engine::{Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d};
+use pdfcraft_engine::{Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, NotePlace3d};
 use pdfcraft_prc_render::measure::Reading;
 use pdfcraft_prc_render::{Camera, Projection};
 
@@ -179,9 +179,9 @@ pub(crate) fn dim_text(d: &Dim3d, units: Units) -> String {
     }
 }
 
-/// The dimension layer for `part`, if it has one.
-pub(crate) fn layer_for(layers: &[Layer3d], part: &str) -> Option<usize> {
-    layers.iter().position(|l| l.part == part && l.kind == LayerKind3d::Dimensions)
+/// `part`'s layer of `kind`, if it has one.
+pub(crate) fn layer_for(layers: &[Layer3d], part: &str, kind: LayerKind3d) -> Option<usize> {
+    layers.iter().position(|l| l.part == part && l.kind == kind)
 }
 
 /// What [`paint`] draws.
@@ -288,6 +288,81 @@ pub(crate) fn paint(
     painter.rect_filled(Rect::from_min_size(at, galley.size()).expand2(vec2(8.0, 4.0)), CornerRadius::same(4), BAR);
     painter.galley(at, galley, Color32::WHITE);
     hits
+}
+
+/// Note cards: a pale paper colour, dark text, the picked one outlined.
+const NOTE_FILL: Color32 = Color32::from_rgb(0xFF, 0xF8, 0xD6);
+const NOTE_TEXT: Color32 = Color32::from_rgb(0x1A, 0x1A, 0x1E);
+/// How wide a note's text runs before it wraps, in points.
+pub(crate) const NOTE_WIDTH: f32 = 240.0;
+
+/// What [`paint_notes`] draws.
+pub(crate) struct NotesShown<'a> {
+    pub(crate) layer: &'a Layer3d,
+    pub(crate) picked: Option<usize>,
+    /// A note being written, not yet added.
+    pub(crate) draft: Option<&'a (NotePlace3d, String)>,
+}
+
+/// Where a note's card goes on screen (its top left) and the point its leader goes to.
+pub(crate) fn note_screen(place: &NotePlace3d, r: Rect, size: [u32; 2], camera: &Camera, frame: &PartFrame) -> Option<(Pos2, Option<Pos2>)> {
+    let to_screen = |p: [f64; 3]| -> Option<Pos2> {
+        let [x, y] = camera.project(frame.world_of(p), size[0], size[1])?;
+        let (w, h) = (f64::from(size[0].max(1)), f64::from(size[1].max(1)));
+        Some(pos2(r.left() + (x / w) as f32 * r.width(), r.top() + (y / h) as f32 * r.height()))
+    };
+    match *place {
+        NotePlace3d::Leader { anchor, text_at } => Some((to_screen(text_at)?, to_screen(anchor))),
+        NotePlace3d::Sheet { at } => Some((pos2(r.left() + at[0] as f32 * r.width(), r.top() + at[1] as f32 * r.height()), None)),
+    }
+}
+
+/// Draws a notes layer over the model shown in `r` (a picture `size` pixels big drawn by
+/// `camera`): each note in a card, with a leader to the point it is about. Where each card is.
+pub(crate) fn paint_notes(
+    painter: &egui::Painter,
+    r: Rect,
+    size: [u32; 2],
+    camera: &Camera,
+    frame: &PartFrame,
+    shown: &NotesShown<'_>,
+) -> Vec<(usize, Rect)> {
+    let mut hits = Vec::new();
+    for (k, note) in shown.layer.notes.iter().enumerate() {
+        if let Some((at, anchor)) = note_screen(&note.place, r, size, camera, frame) {
+            let card = note_card(painter, at, anchor, &note.text, shown.picked == Some(k), false);
+            hits.push((k, card));
+        }
+    }
+    if let Some((place, text)) = shown.draft
+        && let Some((at, anchor)) = note_screen(place, r, size, camera, frame)
+    {
+        let empty = text.trim().is_empty();
+        let text = if empty { tl!("Type the note in the panel…") } else { text.as_str() };
+        note_card(painter, at, anchor, text, true, empty);
+    }
+    hits
+}
+
+/// One note's card with its top left at `at`, and a leader with an arrow to `anchor`. The card.
+fn note_card(painter: &egui::Painter, at: Pos2, anchor: Option<Pos2>, text: &str, picked: bool, faint: bool) -> Rect {
+    let colour = if faint { Color32::from_gray(0x80) } else { NOTE_TEXT };
+    let galley = painter.layout(text.to_owned(), crate::theme::regular(13.0), colour, NOTE_WIDTH);
+    let card = Rect::from_min_size(at, galley.size()).expand(6.0);
+    let line = if picked { PICKED } else { NOTE_TEXT };
+    if let Some(tip) = anchor {
+        let from = pos2(tip.x.clamp(card.left(), card.right()), tip.y.clamp(card.top(), card.bottom()));
+        let d = tip - from;
+        if d.length() > 10.0 {
+            let dir = d.normalized();
+            painter.line_segment([from, tip - dir * 6.0], Stroke::new(1.2, line));
+            arrow(painter, tip, dir, line);
+        }
+    }
+    painter.rect_filled(card, CornerRadius::same(3), NOTE_FILL);
+    painter.rect_stroke(card, CornerRadius::same(3), Stroke::new(if picked { 1.5 } else { 1.0 }, line), egui::StrokeKind::Inside);
+    painter.galley(card.min + vec2(6.0, 6.0), galley, colour);
+    card
 }
 
 /// An arrowhead with its point at `tip`, pointing along unit `dir`.

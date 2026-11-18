@@ -42,8 +42,8 @@ pub use lookup::{
     has_visible_fill_sign, is_fill_sign, isolate_annotation, isolate_annotations, page_refs, picture_rotation, set_annots, signature_image,
 };
 pub use model3d::{
-    Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, MAX_DIMENSIONS, MAX_LAYERS, Model3d, Model3dKind, model_3d, model_3d_annotations,
-    model_3d_layers, set_model_3d_layers, shown_model_3d_positions,
+    Dim3d, DimKind3d, Layer3d, LayerKind3d, LayerView3d, MAX_DIMENSIONS, MAX_LAYERS, MAX_NOTE_CHARS, MAX_NOTES, Model3d, Model3dKind, Note3d,
+    NotePlace3d, model_3d, model_3d_annotations, model_3d_layers, set_model_3d_layers, shown_model_3d_positions,
 };
 pub(crate) use modify::n;
 pub use modify::{

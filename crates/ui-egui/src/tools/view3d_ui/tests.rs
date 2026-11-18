@@ -492,3 +492,78 @@ fn view3d_dimension_layer() {
     let id = again.open_new("again.pdf", std::sync::Arc::new(bytes.to_vec())).unwrap();
     assert_eq!(again.get(id).unwrap().model_3d_layers(0, 0).unwrap(), kept);
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): a part picked, Note ticked, a notes layer made, a note
+/// with a leader added by a click on the part and one on the sheet by a click beside it, and
+/// both read back from the saved file; pictures into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_notes_layer -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_notes_layer() {
+    use super::Load;
+    use egui_kittest::kittest::Queryable;
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        let node = scene.nodes.iter().position(|n| n.name.starts_with("Fill Nozzle")).expect("the nozzle");
+        m.parts.select(&scene, Some(node));
+    }
+    h.run_steps(5);
+    h.get_by_label("Note").click();
+    h.run_steps(10);
+    h.get_by_label("Yes").click();
+    h.run_steps(30);
+    let screen = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().screen.unwrap();
+    let click = |h: &mut Harness, at: egui::Pos2| {
+        h.event(egui::Event::PointerMoved(at));
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(10);
+    };
+    let write = |h: &mut Harness, text: &str| {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        m.note_draft.as_mut().expect("a note started").1 = text.to_owned();
+        h.run_steps(3);
+        h.get_by_label("Add note").click();
+        h.run_steps(20);
+    };
+    // On the part, in the middle of the view.
+    click(&mut h, screen.center());
+    assert!(matches!(h.state().views[0].view3d.models.get(&(0, 0)).unwrap().note_draft, Some((pdfcraft_engine::NotePlace3d::Leader { .. }, _))));
+    h.render().unwrap().save(out.join("n1-started.png")).unwrap();
+    write(&mut h, "Tap 10-32 through\nBreak edges");
+    // Beside it, near the bottom left corner.
+    click(&mut h, screen.left_bottom() + egui::vec2(30.0, -80.0));
+    write(&mut h, "All dimensions in inches");
+    h.render().unwrap().save(out.join("n2-notes.png")).unwrap();
+    let app = h.state();
+    let layers = app.session.get(app.views[0].id).unwrap().model_3d_layers(0, 0).unwrap();
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0].kind, pdfcraft_engine::LayerKind3d::Notes);
+    let notes = &layers[0].notes;
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(matches!(notes[0].place, pdfcraft_engine::NotePlace3d::Leader { .. }));
+    assert!(matches!(notes[1].place, pdfcraft_engine::NotePlace3d::Sheet { .. }));
+    let bytes = app.session.save_bytes(app.views[0].id).unwrap();
+    let mut again = pdfcraft_engine::Session::new();
+    let id = again.open_new("again.pdf", std::sync::Arc::new(bytes.to_vec())).unwrap();
+    assert_eq!(again.get(id).unwrap().model_3d_layers(0, 0).unwrap(), layers);
+}

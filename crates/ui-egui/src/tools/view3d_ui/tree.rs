@@ -265,7 +265,10 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
             parts.changed();
             m.hidden_layers.remove(&k);
             m.dims_node = Some(node);
-            if view.dimensioning {
+            let kind = m.layers.get(k).map(|l| l.kind);
+            if (view.dimensioning && kind == Some(pdfcraft_engine::LayerKind3d::Dimensions))
+                || (view.noting && kind == Some(pdfcraft_engine::LayerKind3d::Notes))
+            {
                 m.active = Some(k);
             }
             if let Some(v) = m.layers.get(k).and_then(|l| l.view) {
@@ -412,7 +415,9 @@ fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, layers: 
 fn layer_row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, layers: &mut TreeLayers<'_>, node: usize, k: usize, depth: usize) {
     let Some(layer) = layers.layers.get(k) else { return };
     let copies = super::dims::copies(scene, &layer.part);
-    let mut name = if layer.name.is_empty() { tl!("Dimensions").to_owned() } else { layer.name.clone() };
+    let notes = layer.kind == pdfcraft_engine::LayerKind3d::Notes;
+    let fallback = if notes { tl!("Notes") } else { tl!("Dimensions") };
+    let mut name = if layer.name.is_empty() { fallback.to_owned() } else { layer.name.clone() };
     if copies > 1 {
         name.push_str(&crate::i18n::fmt(tl!(" (shared by {n} copies)"), &[("n", &copies.to_string())]));
     }
@@ -425,7 +430,7 @@ fn layer_row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, layers: &mut TreeLaye
     icons::paint(
         ui,
         Rect::from_min_size(pos2(x, rect.top() + 3.0), vec2(16.0, 16.0)),
-        "ruler",
+        if notes { "sticky-note" } else { "ruler" },
         13.0,
         if hidden { t.text_faint } else { t.accent_text },
     );
@@ -439,7 +444,7 @@ fn layer_row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, layers: &mut TreeLaye
         if !layers.hidden.remove(&k) {
             layers.hidden.insert(k);
         }
-    } else if resp.on_hover_text(tl!("Show this part with its dimensions")).clicked() {
+    } else if resp.on_hover_text(if notes { tl!("Show this part with its notes") } else { tl!("Show this part with its dimensions") }).clicked() {
         layers.open = Some((node, k));
     }
 }
