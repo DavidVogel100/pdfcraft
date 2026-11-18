@@ -12,6 +12,11 @@ use crate::{Camera, Frame};
 
 /// Segments meeting at more than this angle end an edge: a corner, not the next facet of an arc.
 const CORNER: f64 = 35.0 * std::f64::consts::PI / 180.0;
+/// Facets of one arc: alike in size and in the turn between them within this share.
+const SAME: f64 = 0.3;
+/// Where other edges meet it, an edge goes on only if it turns at least this much there: the
+/// next facet of an arc, not a straight edge running past a joint. Facets of an arc turn more.
+const CURVING: f64 = 0.5 * std::f64::consts::PI / 180.0;
 /// An edge is straight, or an arc, when its points lie this close to the line or circle, as a
 /// share of its length (at least [`ABSOLUTE`]).
 const RELATIVE: f64 = 2e-4;
@@ -45,24 +50,51 @@ impl Edge {
             length(sub(near, add(a, scale(d, t))))
         };
         let start = (0..n - 1).min_by(|&a, &b| gap(a).total_cmp(&gap(b))).unwrap_or(0);
-        let fits = |lo: usize, hi: usize| {
-            let Some(points) = self.path.get(lo..=hi) else { return false };
-            let piece = Edge { mesh: self.mesh, path: points.to_vec() };
-            // Three points always lie on some circle: an arc needs four to show it is one.
-            match piece.shape() {
-                Shape::Line { .. } => true,
-                Shape::Circle { .. } => points.len() >= 4,
-                _ => false,
-            }
-        };
-        let (mut lo, mut hi) = (start, start + 1);
-        // One point more on either side, else one on each or two on one side (an arc shows only
-        // from four points).
-        let steps: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1), (0, 2), (2, 0)];
-        while let Some((down, up)) = steps.iter().copied().find(|&(down, up)| lo >= down && hi + up < n && fits(lo - down, hi + up)) {
-            (lo, hi) = (lo - down, hi + up);
+        if self.path.first() == self.path.last() && start != (n - 1) / 2 {
+            // Round a closed loop: begin it opposite the pick, so the piece can grow both ways.
+            let m = n - 1;
+            let begin = (start + m - m / 2) % m;
+            let path = (0..=m).filter_map(|i| self.path.get((begin + i) % m).copied()).collect();
+            return Edge { mesh: self.mesh, path }.piece(near);
         }
-        Edge { mesh: self.mesh, path: self.path.get(lo..=hi).map_or_else(|| self.path.clone(), <[_]>::to_vec) }
+        // The facets: from corner to corner, past points lying along a facet where another
+        // face's edge meets it.
+        let corners = corner_indices(&self.path);
+        let chords = corners.len() - 1;
+        let Some(picked) = (0..chords).find(|&c| corners.get(c + 1).is_some_and(|&end| start < end)) else { return self.clone() };
+        let point = |c: usize| corners.get(c).and_then(|&i| self.path.get(i)).copied().unwrap_or_default();
+        let span = |c: usize| length(sub(point(c + 1), point(c)));
+        // How far the edge turns at corner `c`, between facets `c - 1` and `c`.
+        let bend = |c: usize| {
+            let (u, v) = (sub(point(c), point(c - 1)), sub(point(c + 1), point(c)));
+            normalize(u).zip(normalize(v)).map_or(std::f64::consts::PI, |(u, v)| dot(u, v).clamp(-1.0, 1.0).acos())
+        };
+        // An arc is tessellated in facets of one size, each turning the same way from the last:
+        // grow from the facet picked over its neighbours while they are alike.
+        let like = |a: f64, b: f64| (a - b).abs() <= SAME * a.max(b);
+        let size = span(picked);
+        let (mut lo, mut hi, mut turn): (usize, usize, Option<f64>) = (picked, picked, None);
+        loop {
+            let fits = |c: usize, at: usize, turn: Option<f64>| {
+                let t = bend(at);
+                like(span(c), size) && (CURVING..=CORNER).contains(&t) && turn.is_none_or(|r| like(t, r))
+            };
+            if hi + 1 < chords && fits(hi + 1, hi + 1, turn) {
+                turn = turn.or(Some(bend(hi + 1)));
+                hi += 1;
+            } else if lo > 0 && fits(lo - 1, lo, turn) {
+                turn = turn.or(Some(bend(lo)));
+                lo -= 1;
+            } else {
+                break;
+            }
+        }
+        let piece = |lo: usize, hi: usize| {
+            let (a, b) = (corners.get(lo).copied().unwrap_or(0), corners.get(hi + 1).copied().unwrap_or(n - 1));
+            Edge { mesh: self.mesh, path: self.path.get(a..=b).map_or_else(|| self.path.clone(), <[_]>::to_vec) }
+        };
+        let arc = piece(lo, hi);
+        if hi > lo && matches!(arc.shape(), Shape::Circle { .. }) { arc } else { piece(picked, picked) }
     }
 
     /// What the edge is: a [`Shape::Line`] for a straight one, a [`Shape::Circle`] for an arc,
@@ -70,8 +102,7 @@ impl Edge {
     #[must_use]
     pub fn shape(&self) -> Shape {
         let (Some(&first), Some(&last)) = (self.path.first(), self.path.last()) else { return Shape::Other };
-        let span: f64 = self.path.windows(2).map(|w| length(sub(w[1], w[0]))).sum();
-        let tolerance = (span * RELATIVE).max(ABSOLUTE);
+        let tolerance = self.tolerance();
         if let Some(direction) = normalize(sub(last, first)) {
             let off = |p: [f64; 3]| {
                 let d = sub(p, first);
@@ -81,8 +112,57 @@ impl Edge {
                 return Shape::Line { from: first, to: last };
             }
         }
-        circle(&self.path, tolerance).unwrap_or(Shape::Other)
+        circle(&facet_corners(&self.path, tolerance), tolerance).unwrap_or(Shape::Other)
     }
+
+    /// How near its line or circle each point must lie.
+    fn tolerance(&self) -> f64 {
+        let span: f64 = self.path.windows(2).map(|w| length(sub(w[1], w[0]))).sum();
+        (span * RELATIVE).max(ABSOLUTE)
+    }
+}
+
+/// Where along `path` its facets meet: the indices of its ends and of each point not lying on
+/// the straight between its neighbours.
+fn corner_indices(path: &[[f64; 3]]) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::with_capacity(path.len());
+    for (i, &p) in path.iter().enumerate() {
+        let (Some(&before), Some(&after)) = (kept.last().and_then(|&k| path.get(k)), path.get(i + 1)) else {
+            kept.push(i);
+            continue;
+        };
+        let reach = length(sub(after, before));
+        let off = normalize(sub(after, before)).map_or(0.0, |d| {
+            let v = sub(p, before);
+            length(sub(v, scale(d, dot(v, d))))
+        });
+        if off > ABSOLUTE + 1e-5 * reach {
+            kept.push(i);
+        }
+    }
+    kept
+}
+
+/// `path` without the points lying on the straight between their neighbours (within
+/// `tolerance`): along an arc only the facets' corners lie on the circle, and a facet may be
+/// split where another face's edge meets it.
+fn facet_corners(path: &[[f64; 3]], tolerance: f64) -> Vec<[f64; 3]> {
+    let mut kept: Vec<[f64; 3]> = Vec::with_capacity(path.len());
+    for (i, &p) in path.iter().enumerate() {
+        let (Some(&before), Some(&after)) = (kept.last(), path.get(i + 1)) else {
+            kept.push(p);
+            continue;
+        };
+        let along = normalize(sub(after, before));
+        let off = along.map_or(0.0, |d| {
+            let v = sub(p, before);
+            length(sub(v, scale(d, dot(v, d))))
+        });
+        if off > tolerance {
+            kept.push(p);
+        }
+    }
+    kept
 }
 
 /// The circle through `path`'s points within `tolerance`, in the plane they lie in; how far
@@ -190,8 +270,8 @@ fn segment_distance_2d(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
 }
 
 /// The run of `mesh`'s outline segments through segment `start`, as points in order: followed
-/// both ways while each joint has just the two segments of this edge and turns less than a
-/// [`CORNER`].
+/// both ways while each joint turns less than a [`CORNER`] and has just the two segments of
+/// this edge, or curves on smoothly one way only (a round split into faces side by side).
 #[must_use]
 pub fn follow(mesh: &TriangleMesh, outlines: &[[u32; 2]], start: usize) -> Vec<[f64; 3]> {
     let pos = |i: u32| usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied());
@@ -213,14 +293,34 @@ pub fn follow(mesh: &TriangleMesh, outlines: &[[u32; 2]], start: usize) -> Vec<[
         for _ in 0..MAX_SEGMENTS {
             let Some(here) = pos(here_index) else { break };
             let Some(joint) = key(here_index).and_then(|k| at.get(&k)) else { break };
-            let next: Vec<usize> = joint.iter().copied().filter(|&s| s != came).collect();
-            let [s] = next.as_slice() else { break };
-            let Some(&[c, d]) = outlines.get(*s) else { break };
-            let far = if key(c) == key(here_index) { d } else { c };
-            let Some(there) = pos(far) else { break };
             let turn =
                 |u: [f64; 3], v: [f64; 3]| normalize(u).zip(normalize(v)).map_or(std::f64::consts::PI, |(u, v)| dot(u, v).clamp(-1.0, 1.0).acos());
-            if turn(sub(here, prev), sub(there, here)) > CORNER || there == pa || there == pb {
+            // Each segment on from here: its far corner, and how far the path turns onto it.
+            let next: Vec<(usize, u32, [f64; 3], f64)> = joint
+                .iter()
+                .copied()
+                .filter(|&s| s != came)
+                .filter_map(|s| {
+                    let &[c, d] = outlines.get(s)?;
+                    let far = if key(c) == key(here_index) { d } else { c };
+                    let there = pos(far)?;
+                    Some((s, far, there, turn(sub(here, prev), sub(there, here))))
+                })
+                .collect();
+            let (s, far, there, bend) = match next.as_slice() {
+                [one] => *one,
+                // More edges meet here. A round split into thin faces side by side has a seam
+                // at every facet: carry on round it while the path curves on smoothly one way
+                // only. A straight edge meeting others ends there, as in a CAD program.
+                many => {
+                    let mut smooth = many.iter().filter(|n| n.3 <= CORNER);
+                    match (smooth.next(), smooth.next()) {
+                        (Some(&one), None) if one.3 >= CURVING => one,
+                        _ => break,
+                    }
+                }
+            };
+            if bend > CORNER || there == pa || there == pb {
                 if there == pa || there == pb {
                     // Round a closed loop: end where it began.
                     out.push(there);
@@ -228,7 +328,7 @@ pub fn follow(mesh: &TriangleMesh, outlines: &[[u32; 2]], start: usize) -> Vec<[
                 break;
             }
             out.push(there);
-            (prev, here_index, came) = (here, far, *s);
+            (prev, here_index, came) = (here, far, s);
         }
         out
     };
