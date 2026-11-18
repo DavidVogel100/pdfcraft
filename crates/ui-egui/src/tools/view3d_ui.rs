@@ -21,6 +21,7 @@ use crate::page_router::{Hit, Owner, PagePress};
 mod dims;
 mod measure;
 mod scene;
+mod sheet;
 #[cfg(test)]
 mod tests;
 mod tree;
@@ -63,12 +64,24 @@ pub(crate) struct View3d {
     ask: Option<Ask>,
     /// An edit to the document made here, for the app to apply.
     edit: Option<pdfcraft_engine::Edit>,
+    /// Print part: the model whose sheet is being set up, how, the sheet made (for the app to
+    /// open) or why it could not be, and the document's name for its title block.
+    sheet_dialog: Option<(usize, usize)>,
+    sheet_choice: sheet::SheetChoice,
+    sheet: Option<pdfcraft_engine::PartSheet>,
+    sheet_error: Option<String>,
+    pub(crate) file_name: String,
 }
 
 impl View3d {
     /// The edit made here since last asked, for the app to apply.
     pub(crate) fn take_edit(&mut self) -> Option<pdfcraft_engine::Edit> {
         self.edit.take()
+    }
+
+    /// The part sheet made since last asked, for the app to open as a new document.
+    pub(crate) fn take_sheet(&mut self) -> Option<pdfcraft_engine::PartSheet> {
+        self.sheet.take()
     }
 }
 

@@ -17,6 +17,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let mut bm_action: Option<BmAction> = None;
     let mut bm_expand: Option<usize> = None;
     let mut panel_edit: Option<pdfcraft_engine::Edit> = None;
+    let mut panel_sheet: Option<pdfcraft_engine::PartSheet> = None;
     let mut field_properties = None;
     let mut panel_command: Option<&'static str> = None;
     let mut sig_action: Option<crate::sign_ui::PanelAction> = None;
@@ -196,10 +197,12 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
                     RightPanel::Model3d => {
+                        view.view3d.file_name.clone_from(&doc.name);
                         crate::view3d_ui::tree_panel(ui, &t, info, &mut view.view3d);
                         if let Some(e) = view.view3d.take_edit() {
                             panel_edit = Some(e);
                         }
+                        panel_sheet = view.view3d.take_sheet();
                     }
                     RightPanel::Comments => {
                         if let Some(e) = crate::comments_panel::show(ui, &t, doc, view, prefs, comment_allowed, &mut nav) {
@@ -436,6 +439,18 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     }
     if let Some(e) = panel_edit {
         app.apply_edit(e);
+    }
+    // Print part: the sheet opens as a new document, to print or save.
+    if let Some(sheet) = panel_sheet {
+        let name = format!("{} sheet.pdf", sheet.title);
+        match app.session.create_part_sheet(&sheet) {
+            Ok(bytes) => {
+                if let Err(e) = app.open_bytes(&name, None, bytes.to_vec()) {
+                    app.notify(e);
+                }
+            }
+            Err(e) => app.notify(e.to_string()),
+        }
     }
     if let Some((name, widget)) = field_properties {
         app.open_field_props(&name, widget);

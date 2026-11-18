@@ -251,6 +251,45 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
                 }
             });
         }
+        let key = (model.page, model.index);
+        if parts.isolated.is_some()
+            && ui.button(tl!("Print part…")).on_hover_text(tl!("A sheet of this part with its dimensions and notes, to print or save")).clicked()
+        {
+            view.sheet_dialog = Some(key);
+            view.sheet_error = None;
+        }
+        if view.sheet_dialog == Some(key) {
+            match sheet_dialog(ui.ctx(), &mut view.sheet_choice, view.sheet_error.as_deref()) {
+                Some(true) => {
+                    let made = parts.isolated.zip(m.camera).ok_or_else(|| tl!("Isolate a part first.").to_owned()).and_then(|(node, camera)| {
+                        let part = super::dims::part_name(&scene, node);
+                        let aspect = m.screen.map_or(1.0, |r| f64::from(r.width() / r.height().max(1.0)));
+                        let subject = super::sheet::Subject {
+                            scene: &scene,
+                            node,
+                            camera,
+                            aspect,
+                            look: &m.look,
+                            layers: super::sheet::shown_layers(&m.layers, &part, &m.hidden_layers),
+                            units: super::measure::Units::of(&scene),
+                            file: &view.file_name,
+                            date: super::sheet::today(),
+                        };
+                        super::sheet::make(&subject, view.sheet_choice)
+                    });
+                    match made {
+                        Ok(s) => {
+                            view.sheet = Some(s);
+                            view.sheet_dialog = None;
+                        }
+                        Err(e) => view.sheet_error = Some(e),
+                    }
+                }
+                Some(false) => view.sheet_dialog = None,
+                None => {}
+            }
+        }
+        let parts = &mut m.parts;
         let mut layers = TreeLayers { layers: &m.layers, hidden: &mut m.hidden_layers, open: None };
         for root in scene.roots().collect::<Vec<_>>() {
             parts.expanded.insert(root);
@@ -285,6 +324,51 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
             ui.label(egui::RichText::new(tl!("Scroll to a 3D model to see its parts.")).color(t.text_muted));
         });
     }
+}
+
+/// Print part's choices: the paper, its way round and the title block. `Some(true)` to make
+/// the sheet, `Some(false)` to cancel, `None` while open.
+fn sheet_dialog(ctx: &egui::Context, choice: &mut super::sheet::SheetChoice, error: Option<&str>) -> Option<bool> {
+    let mut answer = None;
+    let modal = crate::widgets::show_modal(ctx, "view3d-print-part", |ui| {
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new(tl!("Print part")).font(theme::semibold(15.0)));
+        ui.add_space(4.0);
+        ui.label(tl!("The part as it is shown, seen square-on, with its dimensions and notes. It opens as a new PDF to print or save."));
+        ui.add_space(8.0);
+        egui::Grid::new("view3d-sheet-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(tl!("Paper"));
+            craft_ui::ComboBox::from_id_salt("view3d-sheet-paper").selected_text(tl!(choice.paper.name())).show_ui(ui, |ui| {
+                for p in super::sheet::Paper::ALL {
+                    ui.selectable_value(&mut choice.paper, p, tl!(p.name()));
+                }
+            });
+            ui.end_row();
+            ui.label(tl!("Orientation"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut choice.landscape, true, tl!("Landscape"));
+                ui.selectable_value(&mut choice.landscape, false, tl!("Portrait"));
+            });
+            ui.end_row();
+        });
+        ui.add(crate::widgets::checkbox(&mut choice.title_block, tl!("Title block")));
+        if let Some(e) = error {
+            ui.label(egui::RichText::new(e).color(Color32::from_rgb(0xC0, 0x2B, 0x2B)));
+        }
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::widgets::pill_button(ui, tl!("Make sheet"), true).clicked() {
+                answer = Some(true);
+            }
+            if crate::widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(false);
+    }
+    answer
 }
 
 /// The model's dimension layers as the tree lists them under their parts, and the one opened.

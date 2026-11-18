@@ -124,6 +124,8 @@ pub use pdfcraft_edit::{EditableObject, MAX_MOVE_OBJECTS, ObjectKind, ObjectTarg
 pub use pdfcraft_fonts::{MAX_SIGNATURE_CHARS, ScriptOutline, script_missing, script_outline, undrawable_message};
 
 /// Comment geometry helpers (text-box line breaking) for frontends.
+mod part_sheet;
+pub use part_sheet::{PartSheet, SheetMark, SheetPicture, part_sheet, sheet_text};
 pub use pdfcraft_annot::appearance as annot_text;
 pub use pdfcraft_annot::links::{Highlight as LinkHighlight, LinkAction, LinkItem, LinkStyle, LinkZoom};
 pub use pdfcraft_annot::{

@@ -567,3 +567,95 @@ fn view3d_notes_layer() {
     let id = again.open_new("again.pdf", std::sync::Arc::new(bytes.to_vec())).unwrap();
     assert_eq!(again.get(id).unwrap().model_3d_layers(0, 0).unwrap(), layers);
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): the nozzle dimensioned and noted, then Print part makes a
+/// sheet that opens as a new document; it and a picture of it go into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_part_sheet -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_part_sheet() {
+    use super::Load;
+    use egui_kittest::kittest::Queryable;
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("Hypochlorous.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let hole = {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        let node = scene.nodes.iter().position(|n| n.name.starts_with("Fill Nozzle")).expect("the nozzle");
+        m.parts.select(&scene, Some(node));
+        // A whole round hole in it, to dimension.
+        scene.nodes[node]
+            .meshes
+            .iter()
+            .find_map(|&mi| {
+                let mesh = &scene.meshes[mi].mesh;
+                mesh.faces.iter().find_map(|f| {
+                    let fit = pdfcraft_prc_render::shapes::fit_face(mesh, f.clone());
+                    let pdfcraft_prc_render::shapes::Shape::Cylinder { sweep, .. } = fit.shape else { return None };
+                    let t = mesh.triangles[f.start];
+                    let c = [0, 1, 2].map(|a| (0..3).map(|v| mesh.positions[t[v] as usize][a]).sum::<f64>() / 3.0);
+                    (sweep > 6.0).then_some((mi, c))
+                })
+            })
+            .unwrap()
+    };
+    h.run_steps(5);
+    h.get_by_label("Dimension").click();
+    h.run_steps(10);
+    h.get_by_label("Yes").click();
+    h.run_steps(30);
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        m.measure.pick(&scene.meshes, hole.0, hole.1);
+    }
+    h.run_steps(5);
+    h.get_all_by_label("Keep").next().expect("Keep").click();
+    h.run_steps(20);
+    h.get_by_label("Note").click();
+    h.run_steps(10);
+    h.get_by_label("Yes").click();
+    h.run_steps(30);
+    let screen = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().screen.unwrap();
+    for (at, text) in [(screen.center(), "Tap 10-32 through"), (screen.left_bottom() + egui::vec2(30.0, -80.0), "Break all edges")] {
+        h.event(egui::Event::PointerMoved(at));
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(10);
+        h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap().note_draft.as_mut().unwrap().1 = text.to_owned();
+        h.run_steps(3);
+        h.get_by_label("Add note").click();
+        h.run_steps(20);
+    }
+    h.get_by_label("Print part…").click();
+    h.run_steps(10);
+    h.render().unwrap().save(out.join("s1-dialog.png")).unwrap();
+    h.get_by_label("Make sheet").click();
+    h.run_steps(60);
+    assert_eq!(h.state().views.len(), 2, "the sheet opened as a new document");
+    let app = h.state();
+    let sheet = app.session.save_bytes(app.views[1].id).unwrap();
+    std::fs::write(out.join("part sheet.pdf"), sheet.as_slice()).unwrap();
+    for _ in 0..30 {
+        h.run_steps(5);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    h.render().unwrap().save(out.join("s2-sheet.png")).unwrap();
+}
