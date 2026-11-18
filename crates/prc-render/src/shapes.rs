@@ -72,18 +72,6 @@ pub const MIN_SPHERE_CORNERS: usize = 10;
 /// Faces with more corners than this are fitted on an even sample of them.
 const MAX_CORNERS: usize = 20_000;
 
-/// Debugging: each candidate's deviation and the tolerance (not for release).
-#[doc(hidden)]
-#[must_use]
-pub fn candidates(mesh: &TriangleMesh, triangles: Range<usize>) -> Vec<(Shape, f64)> {
-    let (points, normals) = corners_of(mesh, triangles);
-    [plane(&points), cylinder(&points, &normals), sphere(&points)]
-        .into_iter()
-        .flatten()
-        .map(|s| (s, points.iter().map(|&p| distance(&s, p)).fold(0.0, f64::max)))
-        .collect()
-}
-
 fn corners_of(mesh: &TriangleMesh, triangles: Range<usize>) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
     let mut seen = std::collections::HashSet::new();
     let (mut points, mut normals) = (Vec::new(), Vec::new());
