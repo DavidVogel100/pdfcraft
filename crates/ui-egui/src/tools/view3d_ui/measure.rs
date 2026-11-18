@@ -18,6 +18,8 @@ pub(crate) struct Measure {
     pub(crate) readings: Vec<Reading>,
     /// The edges picked, as the points along them, drawn over the model.
     pub(crate) edges: Vec<Vec<[f64; 3]>>,
+    /// Per reading, where the user dragged its label: from the point it measures, on screen.
+    pub(crate) moved: Vec<Option<egui::Vec2>>,
 }
 
 impl Measure {
@@ -57,12 +59,14 @@ impl Measure {
             }
             _ => Vec::new(),
         };
+        self.moved = vec![None; self.readings.len()];
     }
 
     pub(crate) fn clear(&mut self) {
         self.picks.clear();
         self.readings.clear();
         self.edges.clear();
+        self.moved.clear();
     }
 }
 
@@ -118,8 +122,8 @@ pub(crate) fn kind(r: &Reading) -> &'static str {
 }
 
 /// Draws `m`'s picks and readings over the model shown in `r`, drawn by `camera` into a picture
-/// `size` pixels big.
-pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &Camera, m: &Measure, units: Units) {
+/// `size` pixels big. Where each reading's label is, for dragging it.
+pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &Camera, m: &Measure, units: Units) -> Vec<(usize, Rect)> {
     let to_screen = |p: [f64; 3]| -> Option<Pos2> {
         let [x, y] = camera.project(p, size[0], size[1])?;
         let (w, h) = (f64::from(size[0].max(1)), f64::from(size[1].max(1)));
@@ -138,7 +142,8 @@ pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &C
             painter.circle(at, 4.0, Color32::WHITE, stroke);
         }
     }
-    for reading in &m.readings {
+    let mut hits = Vec::new();
+    for (k, reading) in m.readings.iter().enumerate() {
         let (from, to, label_at) = match *reading {
             Reading::Diameter { centre, at, .. } | Reading::Radius { centre, at, .. } => (Some(centre), Some(at), at),
             Reading::Distance { from, to, .. } => (Some(from), Some(to), [0, 1, 2].map(|k| (from[k] + to[k]) / 2.0)),
@@ -150,22 +155,43 @@ pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &C
             painter.circle_filled(b, 2.5, INK);
         }
         if let Some(at) = to_screen(label_at) {
-            label(painter, r, at + vec2(8.0, -8.0), &text(reading, units));
+            // Beside the point, one under another, until dragged away: then a leader with an
+            // arrow points back at what it measures.
+            let moved = m.moved.get(k).copied().flatten();
+            let offset = moved.unwrap_or(vec2(8.0, -8.0 + 24.0 * k as f32));
+            let card = label(painter, r, at + offset, &text(reading, units), moved.map(|_| at));
+            hits.push((k, card));
         }
     }
+    hits
 }
 
-/// A reading's value in a small card beside where it is measured, kept inside the view `area`
-/// (moved in from an edge it would run past).
-fn label(painter: &egui::Painter, area: Rect, at: Pos2, text: &str) {
+/// A reading's value in a small card at `at`, kept inside the view `area` (moved in from an
+/// edge it would run past), with a leader from the card to `points_to` when it has been moved
+/// away. The card.
+fn label(painter: &egui::Painter, area: Rect, at: Pos2, text: &str, points_to: Option<Pos2>) -> Rect {
     let galley = painter.layout_no_wrap(text.to_owned(), crate::theme::semibold(12.0), Color32::WHITE);
     let size = galley.size();
     let inner = area.shrink(4.0);
     let x = at.x.min(inner.right() - size.x).max(inner.left());
     let y = at.y.min(inner.bottom() - size.y).max(inner.top());
     let at = pos2(x, y);
-    painter.rect_filled(Rect::from_min_size(at, size).expand(4.0), CornerRadius::same(3), INK);
+    let card = Rect::from_min_size(at, size).expand(4.0);
+    if let Some(tip) = points_to {
+        // From the card's nearest edge to the point, an arrowhead at the point.
+        let from = pos2(tip.x.clamp(card.left(), card.right()), tip.y.clamp(card.top(), card.bottom()));
+        let d = tip - from;
+        if d.length() > 10.0 {
+            let dir = d.normalized();
+            painter.line_segment([from, tip - dir * 6.0], Stroke::new(1.5, INK));
+            let back = tip - dir * 10.0;
+            let side = vec2(-dir.y, dir.x) * 4.0;
+            painter.add(egui::Shape::convex_polygon(vec![tip, back + side, back - side], INK, Stroke::NONE));
+        }
+    }
+    painter.rect_filled(card, CornerRadius::same(3), INK);
     painter.galley(at, galley, Color32::WHITE);
+    card
 }
 
 /// The Measure and Dimension switches, what each shown model's measurement reads (with Keep,

@@ -115,6 +115,9 @@ struct Model {
     dim_drag: Option<(usize, egui::Vec2)>,
     /// Where the active layer's dimension texts were drawn last frame (screen).
     dim_hits: Vec<(usize, Rect)>,
+    /// Where the measurement's labels were drawn last frame (screen), and the one being dragged.
+    label_hits: Vec<(usize, Rect)>,
+    label_drag: Option<usize>,
     /// The node dimensioning last followed, and the part whose new layer to make active.
     dims_node: Option<usize>,
     want_part: Option<String>,
@@ -199,8 +202,16 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
     } else {
         tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset")
     };
-    // Measuring wants a precise point: a thin crosshair, not a hand.
-    let icon = if view.measuring { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grab };
+    // Measuring wants a precise point: a thin crosshair, not a hand; a label or a dimension's
+    // text can be moved.
+    let on_label = view.models.get(&(page, m.index)).is_some_and(|shown| shown.label_hits.iter().chain(&shown.dim_hits).any(|(_, r)| r.contains(p)));
+    let icon = if on_label {
+        egui::CursorIcon::Move
+    } else if view.measuring {
+        egui::CursorIcon::Crosshair
+    } else {
+        egui::CursorIcon::Grab
+    };
     Some(Hit { tip: Some(tip.into()), ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, icon) })
 }
 
@@ -239,6 +250,30 @@ pub(crate) fn page_input(
         _ => None,
     };
     let Some(camera) = m.camera.as_mut() else { return true };
+    // A measurement's label: dragged away from what it measures, a leader pointing back.
+    if ptr.drag_started
+        && let Some(at) = m.press_at.or(ptr.origin)
+        && let Some(&(k, _)) = m.label_hits.iter().rev().find(|(_, r)| r.contains(at))
+    {
+        m.label_drag = Some(k);
+    }
+    if let Some(k) = m.label_drag {
+        let d = resp.drag_delta();
+        if let Some(slot) = m.measure.moved.get_mut(k) {
+            let start = slot.unwrap_or(egui::vec2(8.0, -8.0 + 24.0 * k as f32));
+            *slot = Some(start + d);
+        }
+        if !resp.dragged() || resp.drag_stopped() {
+            m.label_drag = None;
+        }
+        cursor.claim(Layer::Drag, egui::CursorIcon::Move);
+        ui.ctx().request_repaint();
+        return true;
+    }
+    if resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| m.label_hits.iter().any(|(_, r)| r.contains(p))) {
+        // A click on a label is not a pick through it.
+        return true;
+    }
     // A dimension's text on the layer being worked on: picked by a click, moved by a drag.
     let on_dim = |at: Pos2| m.dim_hits.iter().rev().find(|(_, r)| r.contains(at)).map(|&(k, r)| (k, at - r.center()));
     if ptr.drag_started
@@ -407,6 +442,8 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             dim_picked: None,
             dim_drag: None,
             dim_hits: Vec::new(),
+            label_hits: Vec::new(),
+            label_drag: None,
             dims_node: None,
             want_part: None,
         });
@@ -535,7 +572,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
                     }
                 }
             }
-            measure::paint(&painter, r, drawn_size, &drawn_with, &m.measure, units);
+            m.label_hits = measure::paint(&painter, r, drawn_size, &drawn_with, &m.measure, units);
         }
         // While a drag is on, say which it does: the system draws the same cursor for both on
         // Windows, so the frame and a corner label show it.

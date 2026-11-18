@@ -471,6 +471,13 @@ fn view3d_dimension_layer() {
         eprintln!("readings {:?}", m.measure.readings);
     }
     h.run_steps(5);
+    // The reading's label dragged away: a leader points back.
+    let card = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().label_hits.first().map(|(_, r)| r.center()).expect("a label");
+    drag(&mut h, card, egui::vec2(160.0, -90.0), egui::Modifiers::NONE);
+    h.run_steps(5);
+    let moved = h.state().views[0].view3d.models.get(&(0, 0)).unwrap().measure.moved.clone();
+    assert!(moved.first().copied().flatten().is_some_and(|v| v.x > 100.0), "{moved:?}");
+    h.render().unwrap().save(out.join("d1b-label-moved.png")).unwrap();
     h.get_all_by_label("Keep").next().expect("Keep").click();
     h.run_steps(20);
     h.render().unwrap().save(out.join("d2-kept.png")).unwrap();
