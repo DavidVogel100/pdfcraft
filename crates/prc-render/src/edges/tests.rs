@@ -62,7 +62,7 @@ fn an_arc_running_smoothly_into_a_straight_is_read_as_the_piece_picked() {
     assert_eq!(whole.path.len(), 9, "followed round the smooth join");
     assert_eq!(whole.shape(), Shape::Other);
     // Picked on the curve: the arc alone.
-    let on_arc = whole.piece([0.5 * 0.7071, 0.5 * 0.7071, 0.0]);
+    let on_arc = whole.piece([0.5 * std::f64::consts::FRAC_1_SQRT_2, 0.5 * std::f64::consts::FRAC_1_SQRT_2, 0.0]);
     let Shape::Circle { radius, sweep, .. } = on_arc.shape() else { panic!("{:?}", on_arc.shape()) };
     assert!((radius - 0.5).abs() < 1e-12 && (sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
     // Picked on the straight: the straight alone, from where the arc ends.
