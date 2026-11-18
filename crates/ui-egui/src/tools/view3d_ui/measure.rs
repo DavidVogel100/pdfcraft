@@ -169,7 +169,15 @@ pub(crate) fn measure_controls(ui: &mut egui::Ui, t: &crate::theme::Tokens, info
                 ui.label(egui::RichText::new(kind(r)).color(t.text_muted).font(crate::theme::regular(12.0)));
                 ui.label(egui::RichText::new(text(r, units)).font(crate::theme::semibold(14.0)));
             }
-            if m.measure.picks.len() == 1 && m.measure.readings.is_empty() {
+            if let [only] = m.measure.picks.as_slice()
+                && m.measure.readings.is_empty()
+            {
+                // What the face picked is, when it has no size of its own to read.
+                let what = match only.fit.map(|f| f.shape) {
+                    Some(pdfcraft_prc_render::shapes::Shape::Plane { .. }) => tl!("A flat face."),
+                    _ => tl!("No simple shape here: a second click measures the distance between the points."),
+                };
+                ui.label(egui::RichText::new(what).font(crate::theme::medium(13.0)));
                 ui.label(egui::RichText::new(tl!("Click a second face to measure between them.")).color(t.text_muted));
             }
             if ui.button(tl!("Clear")).clicked() {

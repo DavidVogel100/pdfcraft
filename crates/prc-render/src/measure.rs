@@ -74,7 +74,7 @@ pub fn picked(meshes: &[crate::WorldMesh], pick: Pick) -> Picked {
     let fit = pick.face.and_then(|f| {
         let mesh = &meshes.get(pick.mesh)?.mesh;
         mesh.faces.get(f)?;
-        Some(fit_face_in(mesh, f))
+        Some(fit_face_in(mesh, f, pick.point))
     });
     Picked { pick, fit }
 }

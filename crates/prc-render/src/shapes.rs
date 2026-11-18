@@ -135,15 +135,63 @@ pub fn fit_face(mesh: &TriangleMesh, triangles: Range<usize>) -> Fit {
 /// the round its two neighbouring faces imply: it meets both tangentially, so their angle and
 /// its width fix its radius.
 #[must_use]
-pub fn fit_face_in(mesh: &TriangleMesh, face: usize) -> Fit {
+///
+/// A face that is none of these as a whole (a producer may make one face of flat sides and the
+/// rounded corners between them) is fitted round `near`, the point picked on it: the largest
+/// patch of its corners about that point that a cylinder fits.
+pub fn fit_face_in(mesh: &TriangleMesh, face: usize, near: [f64; 3]) -> Fit {
     let Some(range) = mesh.faces.get(face).cloned() else {
         return Fit { shape: Shape::Other, deviation: 0.0, tolerance: ABSOLUTE_TOLERANCE, corners: 0 };
     };
-    let fit = fit_face(mesh, range);
-    if matches!(fit.shape, Shape::Cylinder { .. } | Shape::Sphere { .. }) {
-        return fit;
+    let fit = fit_face(mesh, range.clone());
+    match fit.shape {
+        Shape::Cylinder { .. } | Shape::Sphere { .. } => fit,
+        Shape::Plane { .. } => fillet_between_neighbours(mesh, face, fit.tolerance).map_or(fit, |(shape, deviation)| Fit { shape, deviation, ..fit }),
+        Shape::Other => cylinder_near(mesh, range, near).unwrap_or(fit),
     }
-    fillet_between_neighbours(mesh, face, fit.tolerance).map_or(fit, |(shape, deviation)| Fit { shape, deviation, ..fit })
+}
+
+/// The largest patch of the face's corners nearest `near` that a cylinder fits within
+/// tolerance: the curve where the face was picked.
+fn cylinder_near(mesh: &TriangleMesh, triangles: Range<usize>, near: [f64; 3]) -> Option<Fit> {
+    let tris = mesh.triangles.get(triangles)?;
+    let corner = |i: u32| usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied());
+    // Triangles by their distance from the pick, nearest first.
+    let mut by_distance: Vec<(f64, [[f64; 3]; 3])> = tris
+        .iter()
+        .filter_map(|t| {
+            let [a, b, c] = t.map(corner);
+            let (a, b, c) = (a?, b?, c?);
+            let mid = scale(add(add(a, b), c), 1.0 / 3.0);
+            Some((length(sub(mid, near)), [a, b, c]))
+        })
+        .filter(|(d, _)| d.is_finite())
+        .collect();
+    by_distance.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut best = None;
+    let mut n = 8;
+    while n <= by_distance.len().min(MAX_CORNERS) {
+        let patch = by_distance.get(..n)?;
+        let normals: Vec<[f64; 3]> = patch.iter().map(|(_, [a, b, c])| cross(sub(*b, *a), sub(*c, *a))).collect();
+        let mut points: Vec<[f64; 3]> = patch.iter().flat_map(|(_, t)| *t).collect();
+        points.sort_by(|p, q| p.map(f64::to_bits).cmp(&q.map(f64::to_bits)));
+        points.dedup();
+        let (lo, hi) = bounds(&points)?;
+        let tolerance = (length(sub(hi, lo)) * RELATIVE_TOLERANCE).max(ABSOLUTE_TOLERANCE);
+        let fitted = (points.len() >= MIN_CYLINDER_CORNERS).then(|| cylinder(&points, &normals)).flatten().map(|shape| {
+            let deviation = points.iter().map(|&p| distance(&shape, p)).fold(0.0, f64::max);
+            Fit { shape, deviation, tolerance, corners: points.len() }
+        });
+        match fitted {
+            // A real curve: it turns at least a few degrees across the patch.
+            Some(f) if f.deviation <= tolerance && matches!(f.shape, Shape::Cylinder { sweep, .. } if sweep > 5f64.to_radians()) => best = Some(f),
+            // Past where the face stops being one round: keep the last patch that was.
+            _ if best.is_some() => break,
+            _ => {}
+        }
+        n = n.saturating_mul(2);
+    }
+    best
 }
 
 /// The fillet face `face` of `mesh` is, from its neighbours: the two faces it shares the most
@@ -164,11 +212,18 @@ fn fillet_between_neighbours(mesh: &TriangleMesh, face: usize, tolerance: f64) -
         .collect();
     shared.sort_by_key(|(_, pts)| std::cmp::Reverse(pts.len()));
     let [(ga, edge_a), (gb, edge_b), ..] = shared.as_slice() else { return None };
-    let plane_of = |g: usize| match fit_face(mesh, mesh.faces.get(g)?.clone()).shape {
+    // Each neighbour's surface direction where the fillet meets it: a plane's normal, or a
+    // round's (a hole's, a boss's) straight out from its axis or centre there.
+    let normal_at = |g: usize, at: [f64; 3]| match fit_face(mesh, mesh.faces.get(g)?.clone()).shape {
         Shape::Plane { normal, .. } => Some(normal),
-        _ => None,
+        Shape::Cylinder { point, axis, .. } => {
+            let d = sub(at, point);
+            normalize(sub(d, scale(axis, dot(d, axis))))
+        }
+        Shape::Sphere { centre, .. } => normalize(sub(at, centre)),
+        Shape::Other => None,
     };
-    let (mut na, mut nb) = (plane_of(*ga)?, plane_of(*gb)?);
+    let (mut na, mut nb) = (normal_at(*ga, centroid(edge_a))?, normal_at(*gb, centroid(edge_b))?);
     // Both normals turned to the fillet's own side, so the angle between them is its sweep.
     let Shape::Plane { normal: chord_normal, .. } = plane(&own)? else { return None };
     if dot(na, chord_normal) < 0.0 {

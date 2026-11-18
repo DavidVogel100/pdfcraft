@@ -141,20 +141,53 @@ fn a_fillet_one_strip_wide_takes_its_radius_from_the_faces_it_joins() {
     // The fillet strip from the floor's edge (x = r, z = 0) to the wall's (x = 0, z = r).
     quad(&mut m, [[r, 0.0, 0.0], [r, len, 0.0], [0.0, len, r], [0.0, 0.0, r]]);
     assert!(matches!(fit_face(&m, m.faces[2].clone()).shape, Shape::Plane { .. }), "on its own it lies flat");
-    let f = fit_face_in(&m, 2);
+    let f = fit_face_in(&m, 2, [0.1, 1.0, 0.1]);
     let Shape::Cylinder { radius, sweep, axis, point } = f.shape else { panic!("{f:?}") };
     assert!((radius - r).abs() < 1e-12, "R {radius}");
     assert!((sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
     assert!((axis[1].abs() - 1.0).abs() < 1e-12);
     assert!((point[0] - r).abs() < 1e-12 && (point[2] - r).abs() < 1e-12, "{point:?}");
     // The plates themselves stay planes.
-    assert!(matches!(fit_face_in(&m, 0).shape, Shape::Plane { .. }));
+    assert!(matches!(fit_face_in(&m, 0, [1.0, 1.0, 0.0]).shape, Shape::Plane { .. }));
     // A rounded outside edge the same way: the strip from the top's edge (x = 1.75, z = 2) to the
     // side's (x = 2, z = 1.75), round a centre at (1.75, *, 1.75).
     let mut m = TriangleMesh::default();
     quad(&mut m, [[0.0, 0.0, 2.0], [1.75, 0.0, 2.0], [1.75, len, 2.0], [0.0, len, 2.0]]);
     quad(&mut m, [[2.0, 0.0, 0.0], [2.0, len, 0.0], [2.0, len, 1.75], [2.0, 0.0, 1.75]]);
     quad(&mut m, [[1.75, 0.0, 2.0], [1.75, len, 2.0], [2.0, len, 1.75], [2.0, 0.0, 1.75]]);
-    let Shape::Cylinder { radius, point, .. } = fit_face_in(&m, 2).shape else { panic!() };
+    let Shape::Cylinder { radius, point, .. } = fit_face_in(&m, 2, [0.1, 1.0, 0.1]).shape else { panic!() };
     assert!((radius - r).abs() < 1e-12 && (point[0] - 1.75).abs() < 1e-12 && (point[2] - 1.75).abs() < 1e-12, "{radius} {point:?}");
+}
+
+#[test]
+fn a_face_of_flat_sides_and_a_round_corner_reads_the_round_where_it_is_picked() {
+    // One face: a flat side along x, a 0.5 round corner, a flat side along y, as a band 2 high.
+    let r = 0.5;
+    let profile: Vec<[f64; 2]> = (0..=4)
+        .map(|i| [-3.0 + f64::from(i) * 0.75, -r])
+        .chain((1..=12).map(|i| {
+            let a = -std::f64::consts::FRAC_PI_2 + f64::from(i) * std::f64::consts::FRAC_PI_2 / 12.0;
+            [r * a.cos(), r * a.sin()]
+        }))
+        .chain((1..=4).map(|i| [r, f64::from(i) * 0.75]))
+        .collect();
+    let mut m = TriangleMesh::default();
+    for (k, &[x, y]) in profile.iter().enumerate() {
+        m.positions.push([x, y, 0.0]);
+        m.positions.push([x, y, 2.0]);
+        if k > 0 {
+            let (a, b) = (u32::try_from(2 * k - 2).unwrap(), u32::try_from(2 * k).unwrap());
+            m.triangles.push([a, b, b + 1]);
+            m.triangles.push([a, b + 1, a + 1]);
+        }
+    }
+    m.faces = std::iter::once(0..m.triangles.len()).collect();
+    assert_eq!(fit_face(&m, m.faces[0].clone()).shape, Shape::Other, "as a whole, no one shape");
+    // Picked on the corner, 45° round it.
+    let at = [r * std::f64::consts::FRAC_1_SQRT_2, -r * std::f64::consts::FRAC_1_SQRT_2, 1.0];
+    let f = fit_face_in(&m, 0, at);
+    let Shape::Cylinder { radius, .. } = f.shape else { panic!("{f:?}") };
+    assert!((radius - r).abs() < 1e-9, "R {radius}");
+    // Picked on a flat side, nothing round.
+    assert_eq!(fit_face_in(&m, 0, [-2.5, -r, 1.0]).shape, Shape::Other);
 }
