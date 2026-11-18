@@ -3,7 +3,7 @@
 //! and listed in the Model Tree panel, in the model's units.
 
 use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, pos2, vec2};
-use pdfcraft_prc_render::measure::{Pick, Picked, Reading, between, face_at, picked, single};
+use pdfcraft_prc_render::measure::{Pick, Picked, Reading, arc_length, between, face_at, picked, single};
 use pdfcraft_prc_render::{Camera, WorldMesh};
 
 use super::scene::Scene;
@@ -16,19 +16,37 @@ const INK: Color32 = Color32::from_rgb(0xE0, 0x1B, 0x8A);
 pub(crate) struct Measure {
     pub(crate) picks: Vec<Picked>,
     pub(crate) readings: Vec<Reading>,
+    /// The edges picked, as the points along them, drawn over the model.
+    pub(crate) edges: Vec<Vec<[f64; 3]>>,
 }
 
 impl Measure {
     /// A click on the model at world point `point`, on mesh `mesh`: the face there is picked,
     /// starting again after two.
     pub(crate) fn pick(&mut self, meshes: &[WorldMesh], mesh: usize, point: [f64; 3]) {
-        if self.picks.len() >= 2 {
-            self.picks.clear();
-        }
+        self.start_again_after_two();
         let face = meshes.get(mesh).and_then(|m| face_at(&m.mesh, point));
         self.picks.push(picked(meshes, Pick { mesh, face, point }));
+        self.read();
+    }
+
+    /// A click on an edge line at `point`: the edge is picked, as a face would be.
+    pub(crate) fn pick_edge(&mut self, edge: &pdfcraft_prc_render::edges::Edge, point: [f64; 3]) {
+        self.start_again_after_two();
+        self.picks.push(pdfcraft_prc_render::measure::picked_edge(edge, point));
+        self.edges.push(edge.path.clone());
+        self.read();
+    }
+
+    fn start_again_after_two(&mut self) {
+        if self.picks.len() >= 2 {
+            self.clear();
+        }
+    }
+
+    fn read(&mut self) {
         self.readings = match self.picks.as_slice() {
-            [a] => single(a).into_iter().collect(),
+            [a] => single(a).into_iter().chain(arc_length(a)).collect(),
             [a, b] => {
                 let mut out = between(a, b);
                 // Each hole's own size too, as a drawing gives both.
@@ -43,6 +61,7 @@ impl Measure {
     pub(crate) fn clear(&mut self) {
         self.picks.clear();
         self.readings.clear();
+        self.edges.clear();
     }
 }
 
@@ -81,6 +100,7 @@ pub(crate) fn text(r: &Reading, units: Units) -> String {
         Reading::Distance { value, exact: true, .. } => units.length(value),
         Reading::Distance { value, exact: false, .. } => format!("≈ {}", units.length(value)),
         Reading::Angle { degrees, .. } => format!("{degrees:.2}°"),
+        Reading::ArcLength { value, .. } => units.length(value),
     }
 }
 
@@ -92,6 +112,7 @@ pub(crate) fn kind(r: &Reading) -> &'static str {
         Reading::Distance { exact: true, .. } => tl!("Distance"),
         Reading::Distance { exact: false, .. } => tl!("Distance between the points picked"),
         Reading::Angle { .. } => tl!("Angle"),
+        Reading::ArcLength { .. } => tl!("Arc length"),
     }
 }
 
@@ -104,6 +125,13 @@ pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &C
         Some(pos2(r.left() + (x / w) as f32 * r.width(), r.top() + (y / h) as f32 * r.height()))
     };
     let stroke = Stroke::new(2.0, INK);
+    // Picked edges, along their length.
+    for path in &m.edges {
+        let points: Vec<Pos2> = path.iter().filter_map(|&p| to_screen(p)).collect();
+        if points.len() >= 2 {
+            painter.add(egui::Shape::line(points, Stroke::new(3.0, INK)));
+        }
+    }
     for p in &m.picks {
         if let Some(at) = to_screen(p.pick.point) {
             painter.circle(at, 4.0, Color32::WHITE, stroke);
@@ -113,7 +141,7 @@ pub(crate) fn paint(painter: &egui::Painter, r: Rect, size: [u32; 2], camera: &C
         let (from, to, label_at) = match *reading {
             Reading::Diameter { centre, at, .. } | Reading::Radius { centre, at, .. } => (Some(centre), Some(at), at),
             Reading::Distance { from, to, .. } => (Some(from), Some(to), [0, 1, 2].map(|k| (from[k] + to[k]) / 2.0)),
-            Reading::Angle { at, .. } => (None, None, at),
+            Reading::Angle { at, .. } | Reading::ArcLength { at, .. } => (None, None, at),
         };
         if let (Some(a), Some(b)) = (from.and_then(to_screen), to.and_then(to_screen)) {
             painter.line_segment([a, b], stroke);

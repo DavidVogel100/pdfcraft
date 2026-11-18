@@ -30,6 +30,8 @@ pub(crate) use tree::{section_controls, tree_panel};
 
 /// The largest side drawn at rest, in pixels; while the model moves, half of what it would be.
 const MAX_SIDE: f32 = 1600.0;
+/// How near an edge line a measuring click picks it rather than the face beside it, in points.
+const EDGE_REACH: f64 = 5.0;
 /// How long after the last move the model is drawn sharp again (seconds).
 const SETTLE: f64 = 0.25;
 const BACKGROUND: [u8; 4] = [255, 255, 255, 255];
@@ -229,10 +231,22 @@ pub(crate) fn page_input(
             Some((f.mesh_at(x, y)?, f.point_at(x, y, &drawn_with)))
         });
         let scene = Arc::clone(scene);
+        // An edge line within a few points of the click, as CAD programs pick edges first.
+        let edge = if measuring {
+            m.frame.as_ref().zip(m.drawn).and_then(|(f, (drawn_with, _, _))| {
+                let per_point = f64::from(f.image.width) / f64::from(r.width().max(1.0));
+                let at = (f64::from(p.x - r.left()) * per_point, f64::from(p.y - r.top()) * per_point);
+                let outlines = m.look.outlines.as_deref()?;
+                pdfcraft_prc_render::edges::edge_near(&scene.meshes, outlines, &m.look.hidden, &drawn_with, f, at, EDGE_REACH * per_point)
+            })
+        } else {
+            None
+        };
         if measuring {
             // A click beside the model starts the measurement again.
-            match under {
-                Some((mesh, Some(point))) => m.measure.pick(&scene.meshes, mesh, point),
+            match (edge, under) {
+                (Some((edge, point)), _) => m.measure.pick_edge(&edge, point),
+                (None, Some((mesh, Some(point)))) => m.measure.pick(&scene.meshes, mesh, point),
                 _ => m.measure.clear(),
             }
         } else {

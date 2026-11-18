@@ -38,6 +38,11 @@ pub enum Shape {
     },
     /// The points at `radius` from `centre`.
     Sphere { centre: [f64; 3], radius: f64 },
+    /// A straight edge from `from` to `to` (an edge picked, not a face).
+    Line { from: [f64; 3], to: [f64; 3] },
+    /// An arc or circle edge: at `radius` from `centre` in the plane square to the unit `axis`,
+    /// `sweep` radians round (an edge picked, not a face).
+    Circle { centre: [f64; 3], axis: [f64; 3], radius: f64, sweep: f64 },
     /// None of these within [`Fit::tolerance`].
     Other,
 }
@@ -147,51 +152,67 @@ pub fn fit_face_in(mesh: &TriangleMesh, face: usize, near: [f64; 3]) -> Fit {
     match fit.shape {
         Shape::Cylinder { .. } | Shape::Sphere { .. } => fit,
         Shape::Plane { .. } => fillet_between_neighbours(mesh, face, fit.tolerance).map_or(fit, |(shape, deviation)| Fit { shape, deviation, ..fit }),
-        Shape::Other => cylinder_near(mesh, range, near).unwrap_or(fit),
+        Shape::Other | Shape::Line { .. } | Shape::Circle { .. } => cylinder_near(mesh, range, near).unwrap_or(fit),
     }
 }
 
-/// The largest patch of the face's corners nearest `near` that a cylinder fits within
-/// tolerance: the curve where the face was picked.
+/// The round of the face about `near`, where it was picked: for a face swept along one axis
+/// (flat sides and the rounded corners between them, as an extrusion has), its outline seen
+/// end-on, and the largest arc of that outline about the pick that a circle fits.
 fn cylinder_near(mesh: &TriangleMesh, triangles: Range<usize>, near: [f64; 3]) -> Option<Fit> {
-    let tris = mesh.triangles.get(triangles)?;
-    let corner = |i: u32| usize::try_from(i).ok().and_then(|i| mesh.positions.get(i).copied());
-    // Triangles by their distance from the pick, nearest first.
-    let mut by_distance: Vec<(f64, [[f64; 3]; 3])> = tris
-        .iter()
-        .filter_map(|t| {
-            let [a, b, c] = t.map(corner);
-            let (a, b, c) = (a?, b?, c?);
-            let mid = scale(add(add(a, b), c), 1.0 / 3.0);
-            Some((length(sub(mid, near)), [a, b, c]))
-        })
-        .filter(|(d, _)| d.is_finite())
-        .collect();
-    by_distance.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let (points, normals) = corners_of(mesh, triangles);
+    // An extrusion's normals all lie square to its axis: their least spread.
+    let units: Vec<[f64; 3]> = normals.iter().filter_map(|&n| normalize(n)).collect();
+    let axis = smallest_eigenvector(scatter(units.iter().copied()))?;
+    if units.iter().any(|&n| dot(n, axis).abs() > 0.02) {
+        return None;
+    }
+    let u = normalize(cross(axis, if axis[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] }))?;
+    let w = cross(axis, u);
+    let flat = |p: [f64; 3]| [dot(p, u), dot(p, w)];
+    // The outline seen end-on: corners along the axis fall on one point.
+    let mut outline: Vec<[f64; 2]> = points.iter().map(|&p| flat(p)).collect();
+    let (lo, hi) = bounds(&points)?;
+    let tolerance = (length(sub(hi, lo)) * RELATIVE_TOLERANCE).max(ABSOLUTE_TOLERANCE);
+    let snap = |v: f64| (v / tolerance).round();
+    outline.sort_by(|a, b| (snap(a[0]), snap(a[1])).partial_cmp(&(snap(b[0]), snap(b[1]))).unwrap_or(std::cmp::Ordering::Equal));
+    outline.dedup_by(|a, b| snap(a[0]) == snap(b[0]) && snap(a[1]) == snap(b[1]));
+    let at = flat(near);
+    let gap = |p: &[f64; 2]| ((p[0] - at[0]).powi(2) + (p[1] - at[1]).powi(2)).sqrt();
+    outline.sort_by(|a, b| gap(a).total_cmp(&gap(b)));
+    // Grow the arc about the pick while a circle still fits it.
     let mut best = None;
-    let mut n = 8;
-    while n <= by_distance.len().min(MAX_CORNERS) {
-        let patch = by_distance.get(..n)?;
-        let normals: Vec<[f64; 3]> = patch.iter().map(|(_, [a, b, c])| cross(sub(*b, *a), sub(*c, *a))).collect();
-        let mut points: Vec<[f64; 3]> = patch.iter().flat_map(|(_, t)| *t).collect();
-        points.sort_by(|p, q| p.map(f64::to_bits).cmp(&q.map(f64::to_bits)));
-        points.dedup();
-        let (lo, hi) = bounds(&points)?;
-        let tolerance = (length(sub(hi, lo)) * RELATIVE_TOLERANCE).max(ABSOLUTE_TOLERANCE);
-        let fitted = (points.len() >= MIN_CYLINDER_CORNERS).then(|| cylinder(&points, &normals)).flatten().map(|shape| {
-            let deviation = points.iter().map(|&p| distance(&shape, p)).fold(0.0, f64::max);
-            Fit { shape, deviation, tolerance, corners: points.len() }
-        });
-        match fitted {
-            // A real curve: it turns at least a few degrees across the patch.
-            Some(f) if f.deviation <= tolerance && matches!(f.shape, Shape::Cylinder { sweep, .. } if sweep > 5f64.to_radians()) => best = Some(f),
-            // Past where the face stops being one round: keep the last patch that was.
+    let mut n = 4;
+    while n <= outline.len() {
+        let near_points = outline.get(..n)?;
+        match circle(near_points) {
+            Some((cx, cy, radius))
+                if near_points.iter().all(|&[x, y]| (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - radius).abs() <= tolerance) =>
+            {
+                best = Some((cx, cy, radius, n));
+            }
             _ if best.is_some() => break,
             _ => {}
         }
-        n = n.saturating_mul(2);
+        n += 1;
     }
-    best
+    let (cx, cy, radius, n) = best?;
+    // How far round the arc goes: its widest angle between neighbouring points, taken from 2π.
+    let mut angles: Vec<f64> = outline.get(..n)?.iter().map(|&[x, y]| (y - cy).atan2(x - cx)).collect();
+    angles.sort_by(f64::total_cmp);
+    let widest = angles
+        .windows(2)
+        .map(|p| p[1] - p[0])
+        .chain(angles.first().zip(angles.last()).map(|(a, b)| a + std::f64::consts::TAU - b))
+        .fold(0.0, f64::max);
+    let sweep = std::f64::consts::TAU - widest;
+    // A real curve, not three points of a flat side that a huge circle fits.
+    if sweep < 5f64.to_radians() {
+        return None;
+    }
+    let centre_on_axis = add(add(scale(u, cx), scale(w, cy)), scale(axis, dot(near, axis)));
+    let shape = Shape::Cylinder { point: centre_on_axis, axis, radius, sweep };
+    Some(Fit { shape, deviation: 0.0, tolerance, corners: n })
 }
 
 /// The fillet face `face` of `mesh` is, from its neighbours: the two faces it shares the most
@@ -221,7 +242,7 @@ fn fillet_between_neighbours(mesh: &TriangleMesh, face: usize, tolerance: f64) -
             normalize(sub(d, scale(axis, dot(d, axis))))
         }
         Shape::Sphere { centre, .. } => normalize(sub(at, centre)),
-        Shape::Other => None,
+        Shape::Other | Shape::Line { .. } | Shape::Circle { .. } => None,
     };
     let (mut na, mut nb) = (normal_at(*ga, centroid(edge_a))?, normal_at(*gb, centroid(edge_b))?);
     // Both normals turned to the fillet's own side, so the angle between them is its sweep.
@@ -266,6 +287,13 @@ pub fn distance(shape: &Shape, p: [f64; 3]) -> f64 {
         Shape::Plane { point, normal } => dot(sub(p, point), normal).abs(),
         Shape::Cylinder { point, axis, radius, .. } => (off_axis(p, point, axis) - radius).abs(),
         Shape::Sphere { centre, radius } => (length(sub(p, centre)) - radius).abs(),
+        Shape::Line { from, to } => normalize(sub(to, from)).map_or(length(sub(p, from)), |d| off_axis(p, from, d)),
+        Shape::Circle { centre, axis, radius, .. } => {
+            let d = sub(p, centre);
+            let along = dot(d, axis);
+            let across = length(sub(d, scale(axis, along)));
+            (along * along + (across - radius) * (across - radius)).sqrt()
+        }
         Shape::Other => 0.0,
     }
 }
@@ -336,6 +364,18 @@ fn smallest_eigenvector(mut m: [[f64; 3]; 3]) -> Option<[f64; 3]> {
     }
     let k = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b]))?;
     normalize([v[0][k], v[1][k], v[2][k]])
+}
+
+/// The plane through `points`' centroid across their least spread ([`Shape::Plane`]).
+#[must_use]
+pub fn fit_plane(points: &[[f64; 3]]) -> Option<Shape> {
+    plane(points)
+}
+
+/// The circle best fitting the flat `points`: centre x, y and radius.
+#[must_use]
+pub fn fit_circle(points: &[[f64; 2]]) -> Option<(f64, f64, f64)> {
+    circle(points)
 }
 
 /// The plane through `points`' centroid across their least spread.

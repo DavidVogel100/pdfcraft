@@ -213,6 +213,37 @@ fn measure_clicks_pick_faces_and_measure_between_them() {
     assert_eq!(picks(&h), 1, "a third click starts again");
 }
 
+/// With Measure on, a click just beside an edge line picks the edge: the triangle's side reads
+/// its length, and is drawn picked.
+#[test]
+fn a_measure_click_beside_an_edge_picks_the_edge() {
+    let (mut h, _) = shown();
+    h.state_mut().views[0].view3d.measuring = true;
+    h.run_steps(2);
+    // Where the middle of the triangle's first side is on the screen.
+    let at = {
+        let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!("not read") };
+        let mesh = &scene.meshes[0].mesh;
+        let [a, b] = m.look.outlines.as_deref().unwrap()[0][0];
+        let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+        let mid = [0, 1, 2].map(|k| (pa[k] + pb[k]) / 2.0);
+        let (camera, size, _) = m.drawn.unwrap();
+        let [x, y] = camera.project(mid, size[0], size[1]).unwrap();
+        let r = m.screen.unwrap();
+        egui::pos2(r.left() + (x / f64::from(size[0])) as f32 * r.width(), r.top() + (y / f64::from(size[1])) as f32 * r.height())
+    };
+    // Two points off the line, still within reach.
+    click(&mut h, at + egui::vec2(2.0, 0.0));
+    let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+    assert_eq!(m.measure.edges.len(), 1, "the edge is picked");
+    assert!(
+        matches!(m.measure.readings.first(), Some(pdfcraft_prc_render::measure::Reading::Distance { exact: true, .. })),
+        "a straight edge reads its length: {:?}",
+        m.measure.readings
+    );
+}
+
 /// Pictures of a real file in the viewer, for looking at by eye: the file in `VIEW3D_PDF`, the
 /// pictures into `VIEW3D_OUT`. `cargo test -p pdfcraft-ui-egui --lib view3d_pictures -- --ignored`
 #[test]

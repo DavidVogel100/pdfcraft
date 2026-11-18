@@ -48,6 +48,8 @@ pub enum Reading {
     Distance { value: f64, from: [f64; 3], to: [f64; 3], exact: bool },
     /// An angle in degrees (0 to 90 between planes or axes), drawn at `at`.
     Angle { degrees: f64, at: [f64; 3] },
+    /// An arc edge's length along its curve, drawn at `at` on it.
+    ArcLength { value: f64, at: [f64; 3] },
 }
 
 /// The CAD face of `mesh` nearest `point` (the one a click on it hit), by its triangles.
@@ -83,6 +85,27 @@ fn shape(p: &Picked) -> Shape {
     p.fit.map_or(Shape::Other, |f| f.shape)
 }
 
+/// `p`'s shape as [`between`] measures it: an arc edge as the round it bounds (its centre line
+/// as the axis), a straight edge as a round of no size along it.
+fn as_measured(p: &Picked) -> Shape {
+    match shape(p) {
+        Shape::Circle { centre, axis, radius, sweep } => Shape::Cylinder { point: centre, axis, radius, sweep },
+        Shape::Line { from, to } => {
+            normalize(sub(to, from)).map_or(Shape::Other, |axis| Shape::Cylinder { point: from, axis, radius: 0.0, sweep: 0.0 })
+        }
+        other => other,
+    }
+}
+
+/// A picked edge, measured as what it is (a [`Shape::Line`] or [`Shape::Circle`]), picked at
+/// `point` on mesh `mesh`.
+#[must_use]
+pub fn picked_edge(edge: &crate::edges::Edge, point: [f64; 3]) -> Picked {
+    let shape = edge.shape();
+    let fit = Fit { shape, deviation: 0.0, tolerance: 0.0, corners: edge.path.len() };
+    Picked { pick: Pick { mesh: edge.mesh, face: None, point }, fit: Some(fit) }
+}
+
 /// What one picked face reads on its own: a hole's diameter, a fillet's radius, a ball's
 /// diameter. Nothing for a plane or an unknown face.
 #[must_use]
@@ -97,7 +120,23 @@ pub fn single(p: &Picked) -> Option<Reading> {
             let at = normalize(sub(p.pick.point, centre)).map_or(p.pick.point, |d| add(centre, scale(d, radius)));
             Some(Reading::Diameter { value: 2.0 * radius, centre, at })
         }
+        // An edge: a straight one's length, an arc's radius or a circle's diameter.
+        Shape::Line { from, to } => Some(Reading::Distance { value: length(sub(to, from)), from, to, exact: true }),
+        Shape::Circle { centre, axis, radius, sweep } => {
+            let d = sub(p.pick.point, centre);
+            let at = normalize(sub(d, scale(axis, dot(d, axis)))).map_or(p.pick.point, |u| add(centre, scale(u, radius)));
+            Some(if sweep >= WHOLE { Reading::Diameter { value: 2.0 * radius, centre, at } } else { Reading::Radius { value: radius, centre, at } })
+        }
         Shape::Plane { .. } | Shape::Other => None,
+    }
+}
+
+/// An arc edge's length round its curve (nothing for a whole circle or anything else).
+#[must_use]
+pub fn arc_length(p: &Picked) -> Option<Reading> {
+    match shape(p) {
+        Shape::Circle { radius, sweep, .. } if sweep < WHOLE => Some(Reading::ArcLength { value: radius * sweep, at: p.pick.point }),
+        _ => None,
     }
 }
 
@@ -109,7 +148,7 @@ pub fn between(a: &Picked, b: &Picked) -> Vec<Reading> {
     let loose = Reading::Distance { value: length(sub(pb, pa)), from: pa, to: pb, exact: false };
     let exact = |from: [f64; 3], to: [f64; 3]| Reading::Distance { value: length(sub(to, from)), from, to, exact: true };
     let angle = |u: [f64; 3], v: [f64; 3], at: [f64; 3]| Reading::Angle { degrees: dot(u, v).abs().clamp(0.0, 1.0).acos().to_degrees(), at };
-    match (shape(a), shape(b)) {
+    match (as_measured(a), as_measured(b)) {
         (Shape::Plane { normal: n1, .. }, Shape::Plane { point: q2, normal: n2 }) => {
             if parallel(n1, n2) {
                 // From the first pick straight across to the second plane.

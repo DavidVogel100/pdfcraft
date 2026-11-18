@@ -68,6 +68,25 @@ fn faces_of_no_known_shape_are_measured_point_to_point_and_say_so() {
 }
 
 #[test]
+fn edges_read_as_lengths_and_radii_and_measure_like_faces() {
+    let line = crate::edges::Edge { mesh: 0, path: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.5, 0.0, 0.0]] };
+    let p = picked_edge(&line, [1.0, 0.0, 0.0]);
+    assert!(matches!(single(&p), Some(Reading::Distance { value, exact: true, .. }) if (value - 2.5).abs() < 1e-12));
+    // A quarter arc of R 0.5 round (0, 0) in the xy plane.
+    let path: Vec<[f64; 3]> =
+        (0..=6).map(|i| f64::from(i) * std::f64::consts::FRAC_PI_2 / 6.0).map(|a| [0.5 * a.cos(), 0.5 * a.sin(), 0.0]).collect();
+    let arc = picked_edge(&crate::edges::Edge { mesh: 0, path }, [0.5, 0.0, 0.0]);
+    assert!(matches!(single(&arc), Some(Reading::Radius { value, .. }) if (value - 0.5).abs() < 1e-12));
+    // Its length round the quarter: π/2 × 0.5.
+    assert!(matches!(arc_length(&arc), Some(Reading::ArcLength { value, .. }) if (value - std::f64::consts::FRAC_PI_4).abs() < 1e-9));
+    assert_eq!(arc_length(&p), None, "a straight edge has its length already");
+    // The arc's centre to a parallel straight edge 2 away.
+    let far = picked_edge(&crate::edges::Edge { mesh: 0, path: vec![[0.0, 2.0, 0.0], [0.0, 2.0, 1.0]] }, [0.0, 2.0, 0.5]);
+    let r = between(&arc, &far);
+    assert!(matches!(r.first(), Some(Reading::Distance { value, exact: true, .. }) if (value - 2.0).abs() < 1e-12), "{r:?}");
+}
+
+#[test]
 fn a_click_finds_the_cad_face_under_it() {
     let mut m = TriangleMesh::default();
     m.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [5.0, 0.0, 0.0], [6.0, 0.0, 0.0], [5.0, 1.0, 0.0]];
