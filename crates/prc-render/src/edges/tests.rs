@@ -53,6 +53,23 @@ fn a_hole_edge_goes_all_the_way_round_and_reads_as_a_whole_circle() {
 }
 
 #[test]
+fn an_arc_running_smoothly_into_a_straight_is_read_as_the_piece_picked() {
+    // A quarter arc of R 0.5 round (0, 0) from (0.5, 0) to (0, 0.5), then straight on to (-2, 0.5).
+    let mut points = arc(0.5, 0.0, std::f64::consts::FRAC_PI_2, 6).into_iter().map(|p| [p[0] - 1.0, p[1] - 2.0, 0.0]).collect::<Vec<_>>();
+    points.extend([[-1.0, 0.5, 0.0], [-2.0, 0.5, 0.0]]);
+    let (m, segs) = chain(&points, false);
+    let whole = Edge { mesh: 0, path: follow(&m, &segs, 2) };
+    assert_eq!(whole.path.len(), 9, "followed round the smooth join");
+    assert_eq!(whole.shape(), Shape::Other);
+    // Picked on the curve: the arc alone.
+    let on_arc = whole.piece([0.5 * 0.7071, 0.5 * 0.7071, 0.0]);
+    let Shape::Circle { radius, sweep, .. } = on_arc.shape() else { panic!("{:?}", on_arc.shape()) };
+    assert!((radius - 0.5).abs() < 1e-12 && (sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    // Picked on the straight: the straight alone, from where the arc ends.
+    assert_eq!(whole.piece([-1.5, 0.5, 0.0]).shape(), Shape::Line { from: [0.0, 0.5, 0.0], to: [-2.0, 0.5, 0.0] });
+}
+
+#[test]
 fn a_joint_where_three_edges_meet_ends_the_edge() {
     // A T: a straight edge along x, with a branch up y from its middle.
     let mut m = TriangleMesh::default();

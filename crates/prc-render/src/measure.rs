@@ -101,7 +101,7 @@ fn as_measured(p: &Picked) -> Shape {
 /// `point` on mesh `mesh`.
 #[must_use]
 pub fn picked_edge(edge: &crate::edges::Edge, point: [f64; 3]) -> Picked {
-    let shape = edge.shape();
+    let shape = edge.piece(point).shape();
     let fit = Fit { shape, deviation: 0.0, tolerance: 0.0, corners: edge.path.len() };
     Picked { pick: Pick { mesh: edge.mesh, face: None, point }, fit: Some(fit) }
 }

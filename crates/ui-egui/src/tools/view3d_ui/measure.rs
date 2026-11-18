@@ -34,7 +34,8 @@ impl Measure {
     pub(crate) fn pick_edge(&mut self, edge: &pdfcraft_prc_render::edges::Edge, point: [f64; 3]) {
         self.start_again_after_two();
         self.picks.push(pdfcraft_prc_render::measure::picked_edge(edge, point));
-        self.edges.push(edge.path.clone());
+        // The piece measured: one straight or one arc.
+        self.edges.push(edge.piece(point).path);
         self.read();
     }
 

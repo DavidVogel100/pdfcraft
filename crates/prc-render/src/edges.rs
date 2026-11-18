@@ -27,6 +27,44 @@ pub struct Edge {
 }
 
 impl Edge {
+    /// The piece of the edge about `near` that is one straight line or one arc: where an arc
+    /// runs smoothly on into a straight (as a fillet meets a wall), CAD programs make two edges,
+    /// but a tessellation keeps no mark of where one ends. Grown from the segment nearest `near`
+    /// both ways while it stays one or the other.
+    #[must_use]
+    pub fn piece(&self, near: [f64; 3]) -> Edge {
+        let n = self.path.len();
+        if n < 3 || !matches!(self.shape(), Shape::Other) {
+            return self.clone();
+        }
+        let gap = |s: usize| {
+            let (Some(&a), Some(&b)) = (self.path.get(s), self.path.get(s + 1)) else { return f64::INFINITY };
+            let d = sub(b, a);
+            let len2 = dot(d, d);
+            let t = if len2 > 0.0 { (dot(sub(near, a), d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            length(sub(near, add(a, scale(d, t))))
+        };
+        let start = (0..n - 1).min_by(|&a, &b| gap(a).total_cmp(&gap(b))).unwrap_or(0);
+        let fits = |lo: usize, hi: usize| {
+            let Some(points) = self.path.get(lo..=hi) else { return false };
+            let piece = Edge { mesh: self.mesh, path: points.to_vec() };
+            // Three points always lie on some circle: an arc needs four to show it is one.
+            match piece.shape() {
+                Shape::Line { .. } => true,
+                Shape::Circle { .. } => points.len() >= 4,
+                _ => false,
+            }
+        };
+        let (mut lo, mut hi) = (start, start + 1);
+        // One point more on either side, else one on each or two on one side (an arc shows only
+        // from four points).
+        let steps: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1), (0, 2), (2, 0)];
+        while let Some((down, up)) = steps.iter().copied().find(|&(down, up)| lo >= down && hi + up < n && fits(lo - down, hi + up)) {
+            (lo, hi) = (lo - down, hi + up);
+        }
+        Edge { mesh: self.mesh, path: self.path.get(lo..=hi).map_or_else(|| self.path.clone(), <[_]>::to_vec) }
+    }
+
     /// What the edge is: a [`Shape::Line`] for a straight one, a [`Shape::Circle`] for an arc,
     /// else [`Shape::Other`].
     #[must_use]
