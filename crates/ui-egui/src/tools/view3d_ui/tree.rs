@@ -357,7 +357,7 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
                 Some(true) => {
                     let made = parts.isolated.zip(m.camera).ok_or_else(|| tl!("Isolate a part first.").to_owned()).and_then(|(node, camera)| {
                         let part = super::dims::part_name(&scene, node);
-                        let aspect = m.screen.map_or(1.0, |r| f64::from(r.width() / r.height().max(1.0)));
+                        let aspect = m.area.or(m.screen).map_or(1.0, |r| f64::from(r.width() / r.height().max(1.0)));
                         let subject = super::sheet::Subject {
                             scene: &scene,
                             node,

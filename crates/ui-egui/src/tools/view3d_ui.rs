@@ -115,8 +115,11 @@ struct Model {
     look_rev: Option<u64>,
     /// Until when the model counts as moving (drawn at half size).
     moving_until: f64,
-    /// Where the model was drawn last (screen), for drags to follow the pointer.
+    /// Where the model's picture was drawn last (screen), for drags to follow the pointer: its
+    /// whole area, or the part of it on screen when the page is zoomed in past it.
     screen: Option<Rect>,
+    /// The model's whole area last frame (screen), which [`Model::camera`] spans.
+    area: Option<Rect>,
     /// During a drag: whether it moves the model (else it turns it), decided as it starts.
     drag: Option<bool>,
     /// The faces picked to measure, and what they read.
@@ -283,7 +286,7 @@ pub(crate) fn page_input(
     let apart = view.explode.apart();
     let measuring = view.measuring && !apart && !(view.dimensioning && m.active.is_none());
     let now = ui.input(|i| i.time);
-    let height = f64::from(m.screen.map_or(400.0, |r| r.height()));
+    let height = f64::from(m.area.or(m.screen).map_or(400.0, |r| r.height()));
     // Shift as the key state says, or as this frame's press carried it: the key state can lag
     // the press when Shift went down just before it.
     let shift = ui.input(|i| {
@@ -414,12 +417,12 @@ pub(crate) fn page_input(
         // A turn goes about the model's surface where the press was, as CAD programs turn it;
         // about the middle of the view when the press was beside the model.
         if starting {
-            m.turn_about = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
+            m.turn_about = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).zip(m.drawn).and_then(|(((p, r), f), (seen, _, _))| {
                 let (w, h) = (f.image.width as f32, f.image.height as f32);
                 let x = (p.x - r.left()) / r.width().max(1.0) * w;
                 let y = (p.y - r.top()) / r.height().max(1.0) * h;
                 // Inside the picture, so the casts are exact.
-                (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, camera)).flatten()
+                (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, &seen)).flatten()
             });
         }
         let d = resp.drag_delta();
@@ -607,6 +610,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             look_rev: None,
             moving_until: 0.0,
             screen: None,
+            area: None,
             drag: None,
             measure: measure::Measure::default(),
             press_at: None,
@@ -701,13 +705,14 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         // The wheel over this model zooms it (up: closer), towards what is under the pointer: the
         // model's surface there, else the point level with the middle of the view.
         if let Some(p) = pointer.filter(|p| view.wheel != 0.0 && r.contains(*p)) {
-            let about = m.frame.as_ref().and_then(|f| {
+            // Under the pointer in the picture last drawn, through the camera it was drawn with.
+            let about = m.frame.as_ref().zip(m.drawn).zip(m.screen).and_then(|((f, (seen, _, _)), shown)| {
                 let (w, h) = (f.image.width, f.image.height);
-                let x = f64::from((p.x - r.left()) / r.width().max(1.0)) * f64::from(w);
-                let y = f64::from((p.y - r.top()) / r.height().max(1.0)) * f64::from(h);
+                let x = f64::from((p.x - shown.left()) / shown.width().max(1.0)) * f64::from(w);
+                let y = f64::from((p.y - shown.top()) / shown.height().max(1.0)) * f64::from(h);
                 // Inside the picture, so the casts are exact.
-                let on_model = (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, &camera)).flatten();
-                on_model.or_else(|| camera.unproject(x, y, w, h, scene::depth_of_target(&camera)))
+                let on_model = (x >= 0.0 && y >= 0.0).then(|| f.point_at(x as u32, y as u32, &seen)).flatten();
+                on_model.or_else(|| seen.unproject(x, y, w, h, scene::depth_of_target(&seen)))
             });
             let about = about.unwrap_or(camera.target);
             scene::zoom_at(&mut camera, about, f64::from(-view.wheel * 0.002).exp());
@@ -719,6 +724,14 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
         if moving {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(SETTLE));
         }
+        // Zoomed in past the model's area, only the part of it on screen is drawn, as sharp as
+        // the screen: a parallel view's window onto it. (A perspective view keeps its whole area.)
+        let full = r;
+        let on_screen = r.intersect(painter.clip_rect());
+        let (r, camera) = match cropped(&camera, full, on_screen) {
+            Some(seen) => (on_screen, seen),
+            None => (full, camera),
+        };
         let scale = (ppp * if moving { 0.5 } else { 1.0 }).min(MAX_SIDE / r.width().max(r.height()).max(1.0));
         // At most MAX_SIDE a side, so the casts are exact.
         let size = [(r.width() * scale).round().max(1.0) as u32, (r.height() * scale).round().max(1.0) as u32];
@@ -760,7 +773,8 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             painter.galley(at, galley, Color32::WHITE);
         }
         m.screen = Some(r);
-        view.rects.push(r);
+        m.area = Some(full);
+        view.rects.push(full);
     }
 }
 
@@ -961,6 +975,28 @@ fn ask_for_layer(ctx: &egui::Context, (part, copies, kind): (&str, usize, pdfcra
         answer = Some(false);
     }
     answer
+}
+
+/// The camera showing just `shown` of the area `full` that `camera` spans: for a parallel view
+/// whose area reaches well past the screen. `None` to draw the whole area.
+fn cropped(camera: &Camera, full: Rect, shown: Rect) -> Option<Camera> {
+    let pdfcraft_prc_render::Projection::Orthographic { height } = camera.projection else { return None };
+    if !shown.is_positive() || (shown.width() >= full.width() * 0.9 && shown.height() >= full.height() * 0.9) {
+        return None;
+    }
+    // Model units per point, across and up the view.
+    let per_point = height / f64::from(full.height().max(1.0));
+    let forward = scene::normalize(scene::sub(camera.target, camera.eye))?;
+    let right = scene::normalize(scene::cross(forward, camera.up))?;
+    let up = scene::cross(right, forward);
+    let off = shown.center() - full.center();
+    let shift = scene::add(scene::scale(right, f64::from(off.x) * per_point), scene::scale(up, -f64::from(off.y) * per_point));
+    Some(Camera {
+        eye: scene::add(camera.eye, shift),
+        target: scene::add(camera.target, shift),
+        up: camera.up,
+        projection: pdfcraft_prc_render::Projection::Orthographic { height: f64::from(shown.height()) * per_point },
+    })
 }
 
 /// Whether `model` is the only thing on its page: no other annotation or link there, and every

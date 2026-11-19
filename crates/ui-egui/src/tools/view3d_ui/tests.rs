@@ -815,3 +815,37 @@ fn view3d_export() {
     h.run_steps(10);
     eprintln!("assembly.stl: {} bytes", std::fs::metadata(out.join("assembly.stl")).map(|m| m.len()).unwrap_or(0));
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): the page zoomed far in, the model's picture is drawn only
+/// for the part of it on screen, as sharp as the screen; a picture into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_zoomed_page -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_zoomed_page() {
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.state_mut().views[0].set_zoom(9.0);
+    for _ in 0..40 {
+        h.run_steps(3);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+    let (shown, area, size) = (m.screen.unwrap(), m.area.unwrap(), m.drawn.unwrap().1);
+    eprintln!("area {area:?} shown {shown:?} picture {size:?}");
+    assert!(area.width() > shown.width() * 2.0, "the area reaches past the screen");
+    assert!(f64::from(size[0]) >= f64::from(shown.width()) * 0.99, "as many pixels as the screen shows");
+    h.render().unwrap().save(out.join("z1-zoomed.png")).unwrap();
+}
