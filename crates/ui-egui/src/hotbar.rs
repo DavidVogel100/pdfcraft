@@ -206,6 +206,89 @@ fn tool_buttons(ui: &mut egui::Ui, app: &PdfCraftApp, tools: &[String], cell: f3
     }
 }
 
+/// A magnifying glass with a dashed window in it, for Zoom window.
+fn paint_zoom_window(ui: &egui::Ui, r: Rect, colour: egui::Color32) {
+    let s = r.width().min(r.height());
+    let c = r.min + vec2(s * 0.42, s * 0.42);
+    let radius = s * 0.33;
+    let stroke = Stroke::new(1.6, colour);
+    let p = ui.painter();
+    p.circle_stroke(c, radius, stroke);
+    let d = vec2(1.0, 1.0).normalized();
+    p.line_segment([c + d * radius, c + d * s * 0.62], Stroke::new(2.0, colour));
+    // The dashed window inside the glass.
+    let w = Rect::from_center_size(c, vec2(radius * 1.05, radius * 0.8));
+    let dash = |a: egui::Pos2, b: egui::Pos2| p.add(egui::Shape::dashed_line(&[a, b], Stroke::new(1.1, colour), 2.0, 1.5));
+    dash(w.left_top(), w.right_top());
+    dash(w.right_top(), w.right_bottom());
+    dash(w.right_bottom(), w.left_bottom());
+    dash(w.left_bottom(), w.left_top());
+}
+
+/// Zoom ▸: in, out, a window dragged to fill the view, and back to the view before. On a page
+/// with a 3D model, they zoom the model; elsewhere the page.
+fn zoom_flyout(ui: &mut egui::Ui, app: &mut PdfCraftApp, cell: f32, popup_align: egui::RectAlign, t: &Tokens) {
+    let window_on = app.quick_tool == QuickTool::MarqueeZoom;
+    let resp = icons::button(ui, "search", cell, window_on, tl!("Zoom tools"));
+    let r = resp.rect;
+    let tri = [r.right_bottom() + vec2(-4.0, -4.0), r.right_bottom() + vec2(-9.0, -4.0), r.right_bottom() + vec2(-4.0, -9.0)];
+    ui.painter().add(egui::Shape::convex_polygon(tri.to_vec(), if window_on { t.accent } else { t.text_faint }, Stroke::NONE));
+    let open = resp.clicked() || resp.secondary_clicked();
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pick {
+        In,
+        Out,
+        Window,
+        Back,
+    }
+    let mut picked = None;
+    egui::Popup::menu(&resp).open_memory(open.then_some(egui::SetOpenCommand::Toggle)).align(popup_align).gap(6.0).show(|ui| {
+        for (pick, label) in [(Pick::In, "Zoom in"), (Pick::Out, "Zoom out"), (Pick::Window, "Zoom window"), (Pick::Back, "Back")] {
+            let on = pick == Pick::Window && window_on;
+            let (row, click) = ui.allocate_exact_size(vec2(180.0, 28.0), Sense::click());
+            let press = theme::Press::track(ui, &click);
+            press.wash(ui, row, 4, on);
+            let body = row.translate(press.offset());
+            let icon = Rect::from_min_size(body.min + vec2(8.0, 6.0), vec2(16.0, 16.0));
+            match pick {
+                Pick::In => icons::paint(ui, icon, "zoom-in", 16.0, t.text),
+                Pick::Out => icons::paint(ui, icon, "zoom-out", 16.0, t.text),
+                Pick::Window => paint_zoom_window(ui, icon, t.text),
+                Pick::Back => icons::paint(ui, icon, "undo-2", 16.0, t.text),
+            }
+            crate::widgets::paint_left(ui, body.left_center() + vec2(34.0, 0.0), tl!(label), theme::regular(13.0), t.text, row.width() - 42.0);
+            let click = theme::hand(click);
+            click.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, tl!(label).to_string()));
+            if click.clicked() {
+                picked = Some(pick);
+                ui.close();
+            }
+        }
+    });
+    let Some(pick) = picked else { return };
+    let Some(index) = app.active else { return };
+    let Some(view) = app.views.get_mut(index) else { return };
+    let page = view.current;
+    match pick {
+        Pick::Window => app.quick_tool = QuickTool::MarqueeZoom,
+        Pick::In | Pick::Out => {
+            let factor = if pick == Pick::In { 1.0 / 1.25 } else { 1.25 };
+            if !view.view3d.zoom_model(page, factor) {
+                view.zoom_back.push(view.zoom);
+                let z = (view.zoom / factor as f32).clamp(0.05, 64.0);
+                view.set_zoom(z);
+            }
+        }
+        Pick::Back => {
+            if !view.view3d.zoom_back(page)
+                && let Some(z) = view.zoom_back.pop()
+            {
+                view.set_zoom(z);
+            }
+        }
+    }
+}
+
 /// Render core quick tools: Select, Hand, Comment groups, Edit text, and Fill & Sign.
 fn core_tool_buttons(ui: &mut egui::Ui, app: &mut PdfCraftApp, cell: f32, popup_align: egui::RectAlign, t: &Tokens) {
     if icons::button(ui, "mouse-pointer-2", cell, app.quick_tool == QuickTool::Select, tl!("Select (V)")).clicked() {
@@ -220,6 +303,7 @@ fn core_tool_buttons(ui: &mut egui::Ui, app: &mut PdfCraftApp, cell: f32, popup_
             app.execute("page.crop");
         }
     });
+    zoom_flyout(ui, app, cell, popup_align, t);
     // Comment ▸, Highlight ▸, Draw ▸ (Acrobat's comment toolbar groups). Clicking a
     // group selects its last-used tool; clicking it again opens the flyout.
     for g in 0..comments::GROUPS.len() {
@@ -970,7 +1054,7 @@ mod tests {
             app.hotbar.position = [0.5, 0.5];
             app.hotbar.picker_open = true;
             let mut fonts = false;
-            let mut harness = Harness::builder().with_size(vec2(1000.0, 900.0)).with_accessibility_check(false).build_ui_state(
+            let mut harness = Harness::builder().with_size(vec2(1200.0, 900.0)).with_accessibility_check(false).build_ui_state(
                 move |ui, app: &mut PdfCraftApp| {
                     if !fonts {
                         ui.ctx().set_fonts(theme::font_definitions());

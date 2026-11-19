@@ -673,6 +673,8 @@ pub struct DocView {
     pub(crate) edit_lines: HashMap<usize, (u64, Vec<pdfcraft_engine::TextBlock>)>,
     /// The document's 3D models as shown on its pages (`view3d_ui`).
     pub(crate) view3d: crate::view3d_ui::View3d,
+    /// Page zooms to go back to (the zoom tools' Back), newest last.
+    pub(crate) zoom_back: Vec<f32>,
     /// Edit text: a click on grouped artwork with text queued [`Edit::PrepareText`] for its page:
     /// the page and the point clicked (user space), whose paragraph opens once the page is
     /// prepared, so one click on grouped text starts editing it.
@@ -1140,6 +1142,7 @@ impl DocView {
             pending_edit: None,
             edit_lines: HashMap::new(),
             view3d: Default::default(),
+            zoom_back: Vec::new(),
             grouped_text_click: None,
             line_editor: None,
             applied_editor: None,

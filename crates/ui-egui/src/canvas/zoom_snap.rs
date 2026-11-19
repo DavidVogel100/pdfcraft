@@ -89,6 +89,9 @@ impl PdfCraftApp {
         match self.quick_tool {
             QuickTool::MarqueeZoom => {
                 let view = &mut self.views[index];
+                if view.view3d.zoom_model_to(rect) {
+                    return;
+                }
                 if rect.width() < 6.0 || rect.height() < 6.0 {
                     // A click zooms in one step around the point.
                     let z = (view.zoom * 1.5).min(64.0);

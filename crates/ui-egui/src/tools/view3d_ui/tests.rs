@@ -849,3 +849,35 @@ fn view3d_zoomed_page() {
     assert!(f64::from(size[0]) >= f64::from(shown.width()) * 0.99, "as many pixels as the screen shows");
     h.render().unwrap().save(out.join("z1-zoomed.png")).unwrap();
 }
+
+#[test]
+fn the_zoom_flyout_zooms_the_model_and_goes_back() {
+    use egui_kittest::kittest::Queryable;
+    let (mut h, at) = shown();
+    let before = camera(&h);
+    let distance = |c: &Camera| direction(c).iter().map(|v| v * v).sum::<f64>().sqrt();
+    let height = |c: &Camera| match c.projection {
+        pdfcraft_prc_render::Projection::Orthographic { height } => height,
+        pdfcraft_prc_render::Projection::Perspective { .. } => distance(c),
+    };
+    h.get_by_label("Zoom tools").click();
+    h.run_steps(3);
+    h.get_by_label("Zoom in").click();
+    h.run_steps(3);
+    assert!(height(&camera(&h)) < height(&before) * 0.9, "closer");
+    h.get_by_label("Zoom tools").click();
+    h.run_steps(3);
+    h.get_by_label("Back").click();
+    h.run_steps(3);
+    assert_eq!(camera(&h), before, "back to the view before");
+    // A window dragged over the model fills the view with it.
+    h.get_by_label("Zoom tools").click();
+    h.run_steps(3);
+    h.get_by_label("Zoom window").click();
+    h.run_steps(3);
+    assert_eq!(h.state().quick_tool, crate::QuickTool::MarqueeZoom);
+    drag(&mut h, at - egui::vec2(40.0, 30.0), egui::vec2(80.0, 60.0), egui::Modifiers::NONE);
+    h.run_steps(5);
+    assert!(height(&camera(&h)) < height(&before) * 0.5, "zoomed to the window");
+    assert_eq!(h.state().views[0].zoom, h.state().views[0].zoom, "the page left as it was");
+}

@@ -57,6 +57,8 @@ pub(crate) struct View3d {
     section: tree::SectionState,
     /// Taking the models apart.
     explode: tree::ExplodeState,
+    /// Views to go back to (the zoom tools' Back), newest last: the model and its camera.
+    back: Vec<((usize, usize), Camera)>,
     /// The Measure tool is on: a click on a model picks a face to measure, not a part.
     measuring: bool,
     /// Dimensioning is on: the part selected is isolated and what is measured can be kept on
@@ -84,6 +86,58 @@ impl View3d {
     /// The edit made here since last asked, for the app to apply.
     pub(crate) fn take_edit(&mut self) -> Option<pdfcraft_engine::Edit> {
         self.edit.take()
+    }
+
+    /// The model shown on `page` (its key), once read and seen.
+    fn shown_on(&self, page: usize) -> Option<(usize, usize)> {
+        let mut keys: Vec<_> = self.models.iter().filter(|(k, m)| k.0 == page && m.camera.is_some() && m.screen.is_some()).map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        keys.first().copied()
+    }
+
+    /// Zoom tools: the model on `page` zoomed in (`factor` below 1) or out about the middle of
+    /// its view. Whether there was one.
+    pub(crate) fn zoom_model(&mut self, page: usize, factor: f64) -> bool {
+        let Some(key) = self.shown_on(page) else { return false };
+        let Some(m) = self.models.get_mut(&key) else { return false };
+        let Some(mut camera) = m.camera else { return false };
+        self.back.push((key, camera));
+        let about = camera.target;
+        scene::zoom_at(&mut camera, about, factor);
+        m.camera = Some(camera);
+        true
+    }
+
+    /// Zoom tools: the model under screen rectangle `rect` zoomed so `rect` fills its view (a
+    /// click: one step in about that point). Whether `rect` was on a model.
+    pub(crate) fn zoom_model_to(&mut self, rect: Rect) -> bool {
+        let Some((&key, m)) = self.models.iter_mut().find(|(_, m)| m.screen.is_some_and(|s| s.contains(rect.center())) && m.camera.is_some()) else {
+            return false;
+        };
+        let (Some(area), Some(mut camera)) = (m.area.or(m.screen), m.camera) else { return false };
+        self.back.push((key, camera));
+        // The window's middle to the view's middle, then closer until the window fills it.
+        let off = area.center() - rect.center();
+        scene::pan(&mut camera, f64::from(off.x), f64::from(off.y), f64::from(area.height()));
+        let factor = if rect.width() < 6.0 || rect.height() < 6.0 {
+            1.0 / 1.5
+        } else {
+            f64::from((rect.width() / area.width().max(1.0)).max(rect.height() / area.height().max(1.0))).clamp(1e-3, 1.0)
+        };
+        let about = camera.target;
+        scene::zoom_at(&mut camera, about, factor);
+        m.camera = Some(camera);
+        true
+    }
+
+    /// Zoom tools' Back: the model on `page` goes back to its view before the last zoom.
+    /// Whether there was one to go back to.
+    pub(crate) fn zoom_back(&mut self, page: usize) -> bool {
+        let Some(at) = self.back.iter().rposition(|(k, _)| k.0 == page) else { return false };
+        let (key, camera) = self.back.remove(at);
+        let Some(m) = self.models.get_mut(&key) else { return false };
+        m.camera = Some(camera);
+        true
     }
 
     /// The STL or STEP file made since last asked, for the app to save.
