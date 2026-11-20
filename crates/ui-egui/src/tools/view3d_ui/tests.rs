@@ -881,3 +881,44 @@ fn the_zoom_flyout_zooms_the_model_and_goes_back() {
     assert!(height(&camera(&h)) < height(&before) * 0.5, "zoomed to the window");
     assert_eq!(h.state().views[0].zoom, h.state().views[0].zoom, "the page left as it was");
 }
+
+/// On a real 3D PDF (`VIEW3D_PDF`): Zoom window's rubberband shows over the model while it is
+/// dragged; a picture mid-drag into `VIEW3D_OUT`.
+/// `cargo test -p pdfcraft-ui-egui --lib view3d_zoom_window_rubberband -- --ignored`
+#[test]
+#[ignore = "needs a real 3D PDF; run by hand"]
+fn view3d_zoom_window_rubberband() {
+    let (Some(pdf), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_OUT")) else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for _ in 0..20 {
+        h.run_steps(3);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.state_mut().quick_tool = crate::QuickTool::MarqueeZoom;
+    let at = h.state().views[0].page_screen_rect(0).unwrap().center() - egui::vec2(150.0, 100.0);
+    h.event(egui::Event::PointerMoved(at));
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    for k in 1..=8 {
+        h.event(egui::Event::PointerMoved(at + egui::vec2(300.0, 200.0) * (k as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    assert!(h.state().views[0].marquee.is_some(), "dragging a window");
+    h.render().unwrap().save(out.join("rubberband.png")).unwrap();
+    h.event(egui::Event::PointerButton { pos: at + egui::vec2(300.0, 200.0), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(5);
+    h.render().unwrap().save(out.join("rubberband-zoomed.png")).unwrap();
+}

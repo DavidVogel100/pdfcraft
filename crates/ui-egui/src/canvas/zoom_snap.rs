@@ -66,7 +66,7 @@ pub(crate) fn page_input(ui: &egui::Ui, resp: &egui::Response, xf: &PageXform, p
         let end = pointer.unwrap_or(start);
         let end = Pos2::new(end.x.clamp(xf.rect.left(), xf.rect.right()), end.y.clamp(xf.rect.top(), xf.rect.bottom()));
         let r = Rect::from_two_pos(start, end);
-        ui.painter().rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_rgb(0x14, 0x73, 0xE6)), egui::StrokeKind::Middle);
+        rubberband(ui, r, xf.rect.intersect(ui.clip_rect()));
         if resp.drag_stopped() || !ptr.primary_down {
             view.marquee = None;
             let (a, b) = (xf.screen_to_view(r.left_top()), xf.screen_to_view(r.right_bottom()));
@@ -80,6 +80,18 @@ pub(crate) fn page_input(ui: &egui::Ui, resp: &egui::Response, xf: &PageXform, p
         let v = xf.screen_to_view(p);
         view.marquee_done = Some((page, Rect::from_min_size(p, egui::Vec2::ZERO), [v.0, v.1, v.0, v.1]));
     }
+}
+
+/// The rectangle being dragged, as a rubberband: a light wash with a dashed black-and-white edge
+/// that shows on light and dark alike. Drawn above the page's contents (a 3D model's picture
+/// included), within `clip`.
+fn rubberband(ui: &egui::Ui, r: Rect, clip: Rect) {
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("marquee-rubberband"));
+    let p = ui.ctx().layer_painter(layer).with_clip_rect(clip);
+    p.rect_filled(r, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x14, 0x73, 0xE6, 28));
+    p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Middle);
+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    p.extend(egui::Shape::dashed_line(&corners, Stroke::new(1.0, Color32::from_gray(20)), 4.0, 4.0));
 }
 
 impl PdfCraftApp {
