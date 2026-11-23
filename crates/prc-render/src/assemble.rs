@@ -35,7 +35,7 @@ impl WorldMesh {
     }
 
     /// The colour triangle `t` draws in, before the render options' default.
-    pub(crate) fn colour_of(&self, t: usize) -> Option<[u8; 4]> {
+    pub fn colour_of(&self, t: usize) -> Option<[u8; 4]> {
         self.triangle_colours.as_ref().and_then(|c| c.get(t).copied().flatten()).or(self.colour)
     }
 }

@@ -798,6 +798,24 @@ fn view3d_export() {
         eprintln!("{file}: {len} bytes");
         assert!(len > 1000, "{file} written");
     }
+    // A sub-assembly (the smallest with three or more parts) as STEP: an assembly of parts.
+    {
+        let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        let triangles = |n: &super::scene::Node| n.meshes.iter().map(|&k| scene.meshes[k].mesh.triangles.len()).sum::<usize>();
+        let node = (0..scene.nodes.len())
+            .filter(|&k| scene.nodes[k].children.iter().filter(|&&c| triangles(&scene.nodes[c]) > 0).count() >= 3)
+            .min_by_key(|&k| scene.nodes[k].children.iter().map(|&c| triangles(&scene.nodes[c])).sum::<usize>())
+            .unwrap();
+        m.parts.isolated = Some(node);
+        m.parts.changed();
+    }
+    h.run_steps(10);
+    h.state_mut().save_override = Some(out.join("sub-assembly.step").to_string_lossy().into_owned());
+    h.get_by_label("Save as STEP…").click();
+    h.run_steps(10);
+    assert!(std::fs::metadata(out.join("sub-assembly.step")).is_ok_and(|m| m.len() > 1000), "sub-assembly written");
     {
         let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
         m.parts.isolated = None;
