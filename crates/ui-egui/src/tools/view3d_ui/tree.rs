@@ -81,7 +81,7 @@ impl Plane {
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub(crate) struct ExplodeState {
     pub(crate) on: bool,
-    /// How far apart, 0 (together) to 1.
+    /// How far apart, 0 (together) to 1 (each part twice as far again from the middle as it is).
     pub(crate) amount: f32,
     /// A drag on a part moves it, rather than turning the model.
     pub(crate) move_parts: bool,
@@ -95,14 +95,14 @@ impl ExplodeState {
 }
 
 /// How far each part is from its place: out from the middle of what is shown, by `amount`
-/// (at 1, as far again as it is from the middle), plus any move by hand.
+/// (at 1, twice as far again as it is from the middle), plus any move by hand.
 pub(crate) fn part_offsets(scene: &Scene, parts: &Parts, explode: &ExplodeState) -> Option<Vec<[f64; 3]>> {
     if !explode.on {
         return None;
     }
     // The middle of what is shown: the part isolated, else the whole model.
     let root_centre = parts.isolated.and_then(|i| scene.centres.get(i).copied().flatten()).or_else(|| scene.bounds.map(|b| b.centre()))?;
-    let k = f64::from(explode.amount.clamp(0.0, 1.0));
+    let k = 2.0 * f64::from(explode.amount.clamp(0.0, 1.0));
     Some(
         scene
             .mesh_nodes
@@ -146,7 +146,7 @@ pub(crate) fn explode_controls(ui: &mut egui::Ui, t: &Tokens, view: &mut View3d)
     ui.separator();
     if view.explode != before {
         if view.explode.on && !before.on && view.explode.amount == 0.0 {
-            view.explode.amount = 0.5;
+            view.explode.amount = 0.25;
         }
         if !view.explode.on {
             view.explode.move_parts = false;
@@ -154,6 +154,32 @@ pub(crate) fn explode_controls(ui: &mut egui::Ui, t: &Tokens, view: &mut View3d)
         for m in view.models.values_mut() {
             m.parts.changed();
         }
+    }
+}
+
+/// Print part…, Save as STL… and Save as STEP…, above the tree so they stay in sight however
+/// far it is scrolled: for the model on `page`, else the document's first.
+pub(crate) fn file_controls(ui: &mut egui::Ui, t: &Tokens, page: usize, view: &mut View3d) {
+    let Some(key) = view.ready_model(page) else { return };
+    let isolated = view.models.get(&key).and_then(|m| m.parts.isolated).is_some();
+    let (mut print, mut stl, mut step) = (false, false, false);
+    ui.horizontal(|ui| {
+        ui.add(icons::image("file-down", 16.0, t.icon));
+        print = isolated && ui.button(tl!("Print part…")).on_hover_text(tl!("A sheet of this part with its dimensions and notes, to print or save")).clicked();
+        stl = ui.button(tl!("Save as STL…")).on_hover_text(tl!("Save what is shown as an STL file, for 3D printing (also File ▸ Export)")).clicked();
+        step = ui
+            .button(tl!("Save as STEP…"))
+            .on_hover_text(tl!("Save what is shown as a STEP file of facets, to open in a CAD program (also File ▸ Export)"))
+            .clicked();
+    });
+    ui.add_space(4.0);
+    ui.separator();
+    if print {
+        view.sheet_dialog = Some(key);
+        view.sheet_error = None;
+    }
+    if stl || step {
+        view.export = view.export_model(page, step);
     }
 }
 
@@ -335,23 +361,6 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
             });
         }
         let key = (model.page, model.index);
-        let (mut print, mut stl, mut step) = (false, false, false);
-        ui.horizontal(|ui| {
-            print = parts.isolated.is_some()
-                && ui.button(tl!("Print part…")).on_hover_text(tl!("A sheet of this part with its dimensions and notes, to print or save")).clicked();
-            stl = ui.button(tl!("STL…")).on_hover_text(tl!("Save what is shown as an STL file, for 3D printing")).clicked();
-            step = ui.button(tl!("STEP…")).on_hover_text(tl!("Save what is shown as a STEP file of facets, to open in a CAD program")).clicked();
-        });
-        if print {
-            view.sheet_dialog = Some(key);
-            view.sheet_error = None;
-        }
-        if stl || step {
-            match super::export::export(&scene, &m.look, parts.isolated, &view.file_name, step) {
-                Ok(file) => view.export = Some(Ok(file)),
-                Err(e) => view.export = Some(Err(e)),
-            }
-        }
         if view.sheet_dialog == Some(key) {
             match sheet_dialog(ui.ctx(), &mut view.sheet_choice, view.sheet_error.as_deref()) {
                 Some(true) => {

@@ -100,6 +100,7 @@ impl PdfCraftApp {
             && match spec.id {
                 "comment.copy" => self.active.and_then(|i| self.views.get(i)).is_some_and(|v| v.comments.selected.is_some()),
                 "comment.paste" => self.comment_clipboard.is_some(),
+                "export.stl" | "export.step" => self.active.and_then(|i| self.views.get(i)).is_some_and(|v| v.view3d.has_model()),
                 "view.previous_view" => self.active.and_then(|i| self.views.get(i)).is_some_and(|v| !v.back.is_empty()),
                 "view.next_view" => self.active.and_then(|i| self.views.get(i)).is_some_and(|v| !v.forward.is_empty()),
                 _ => true,
@@ -159,6 +160,12 @@ impl PdfCraftApp {
                 if self.active.is_some() =>
             {
                 tl!("The document's security settings don't allow this change").to_string()
+            }
+            commands::Needs::Copying
+                if matches!(spec.id, "export.stl" | "export.step")
+                    && self.active_ids().and_then(|(_, id)| self.session.get(id)).is_some_and(|d| d.allows_copying()) =>
+            {
+                tl!("This document has no 3D model to export").to_string()
             }
             commands::Needs::Copying if self.active.is_some() => crate::copy_refused().to_string(),
             commands::Needs::Printing if self.active.is_some() => crate::print_refused().to_string(),
@@ -560,6 +567,19 @@ impl PdfCraftApp {
             }
             "export.image" => self.dialog = Some(Dialog::Export(crate::export_ui::ExportKind::Image)),
             "export.text" => self.dialog = Some(Dialog::Export(crate::export_ui::ExportKind::Text)),
+            "export.stl" | "export.step" => {
+                let made = active.and_then(|i| {
+                    let name = self.views.get(i).and_then(|v| self.session.get(v.id)).map(|d| d.name.clone())?;
+                    let view = self.views.get_mut(i)?;
+                    view.view3d.file_name = name;
+                    view.view3d.export_model(view.current, id == "export.step")
+                });
+                match made {
+                    Some(Ok((name, bytes))) => self.save_model_export(name, bytes),
+                    Some(Err(e)) => self.notify(e),
+                    None => self.notify_tr("This document has no 3D model to export"),
+                }
+            }
             "ocr.recognize" => self.dialog = Some(Dialog::RecognizeText),
             "ocr.enhance" => self.dialog = Some(Dialog::EnhanceScan),
             "ocr.recognize_batch" => self.ocr_files_dialog(),

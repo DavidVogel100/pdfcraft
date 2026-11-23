@@ -790,7 +790,7 @@ fn view3d_export() {
         m.parts.changed();
     }
     h.run_steps(10);
-    for (button, file) in [("STL…", "nozzle.stl"), ("STEP…", "nozzle.step")] {
+    for (button, file) in [("Save as STL…", "part.stl"), ("Save as STEP…", "part.step")] {
         h.state_mut().save_override = Some(out.join(file).to_string_lossy().into_owned());
         h.get_by_label(button).click();
         h.run_steps(10);
@@ -807,11 +807,11 @@ fn view3d_export() {
     // The whole model is too many facets for STEP: not written. As STL it is.
     let _ = std::fs::remove_file(out.join("assembly.step"));
     h.state_mut().save_override = Some(out.join("assembly.step").to_string_lossy().into_owned());
-    h.get_by_label("STEP…").click();
+    h.get_by_label("Save as STEP…").click();
     h.run_steps(10);
     assert!(!out.join("assembly.step").exists(), "too big for STEP");
     h.state_mut().save_override = Some(out.join("assembly.stl").to_string_lossy().into_owned());
-    h.get_by_label("STL…").click();
+    h.get_by_label("Save as STL…").click();
     h.run_steps(10);
     eprintln!("assembly.stl: {} bytes", std::fs::metadata(out.join("assembly.stl")).map(|m| m.len()).unwrap_or(0));
 }
@@ -921,4 +921,21 @@ fn view3d_zoom_window_rubberband() {
     h.event(egui::Event::PointerButton { pos: at + egui::vec2(300.0, 200.0), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
     h.run_steps(5);
     h.render().unwrap().save(out.join("rubberband-zoomed.png")).unwrap();
+}
+
+#[test]
+fn file_export_saves_the_model_as_stl_and_step() {
+    let (mut h, _) = shown();
+    let dir = std::env::temp_dir().join(format!("pdfcraft-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (command, file) in [("export.stl", "model.stl"), ("export.step", "model.step")] {
+        let path = dir.join(file);
+        h.state_mut().save_override = Some(path.to_string_lossy().into_owned());
+        assert!(h.state_mut().execute(command), "{command} runs on a page with a model");
+        h.run_steps(3);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 84, "{file} written");
+    }
+    assert!(std::fs::read_to_string(dir.join("model.step")).unwrap().starts_with("ISO-10303-21;"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

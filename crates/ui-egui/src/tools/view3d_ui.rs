@@ -30,7 +30,7 @@ mod tree;
 
 pub(crate) use measure::measure_controls;
 use scene::Scene;
-pub(crate) use tree::{explode_controls, section_controls, tree_panel};
+pub(crate) use tree::{explode_controls, file_controls, section_controls, tree_panel};
 
 /// The largest side drawn at rest, in pixels; while the model moves, half of what it would be.
 const MAX_SIDE: f32 = 1600.0;
@@ -138,6 +138,26 @@ impl View3d {
         let Some(m) = self.models.get_mut(&key) else { return false };
         m.camera = Some(camera);
         true
+    }
+
+    /// A model read and ready: the one on `page`, else the document's first.
+    fn ready_model(&self, page: usize) -> Option<(usize, usize)> {
+        let mut keys: Vec<_> = self.models.iter().filter(|(_, m)| matches!(m.load, Load::Ready(_))).map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        keys.iter().find(|k| k.0 == page).or_else(|| keys.first()).copied()
+    }
+
+    /// Whether the document has a 3D model read and ready, to export.
+    pub(crate) fn has_model(&self) -> bool {
+        self.ready_model(0).is_some()
+    }
+
+    /// What the model on `page` (else the first) shows, as an STL file or, `as_step`, a STEP
+    /// file: its name and bytes, or why not. `None` when there is no model ready.
+    pub(crate) fn export_model(&self, page: usize, as_step: bool) -> Option<Result<(String, Vec<u8>), String>> {
+        let m = self.models.get(&self.ready_model(page)?)?;
+        let Load::Ready(scene) = &m.load else { return None };
+        Some(export::export(scene, &m.look, m.parts.isolated, &self.file_name, as_step))
     }
 
     /// The STL or STEP file made since last asked, for the app to save.
