@@ -77,6 +77,8 @@ pub(crate) struct View3d {
     sheet_choice: sheet::SheetChoice,
     sheet: Option<pdfcraft_engine::PartSheet>,
     sheet_error: Option<String>,
+    /// The model a right-button drag is on, from its start until the button is up.
+    right_drag: Option<(usize, usize)>,
     /// A file made from a model (its name and bytes), for the app to save.
     /// Or why it could not be made.
     export: Option<Result<(String, Vec<u8>), String>>,
@@ -322,7 +324,7 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
     let m = info.annots_3d.iter().rev().find(|m| m.page == page && area(m).contains(p) && view.ready(page, m.index))?;
     let sliding = view.models.get(&(page, m.index)).is_some_and(|shown| shown.mates.slide.is_some());
     let tip = if sliding {
-        tl!("Drag the part the picked mate holds to slide it · Drag elsewhere to turn · Wheel to zoom")
+        tl!("Drag the part the picked mate holds to slide it · Right-drag a part to slide it along its mate · Wheel to zoom")
     } else if view.explode.move_parts {
         tl!("Drag a part to move it · Shift+drag to move the view · Wheel to zoom")
     } else if view.noting {
@@ -330,7 +332,7 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
     } else if view.measuring {
         tl!("Click a face to measure it, then another to measure between them")
     } else {
-        tl!("Drag to turn · Shift+drag to move · Wheel to zoom · Double-click to reset")
+        tl!("Drag to turn · Shift+drag to move · Right-drag a part to slide it along its mate · Wheel to zoom · Double-click to reset")
     };
     // Measuring wants a precise point: a thin crosshair, not a hand; a label or a dimension's
     // text can be moved.
@@ -346,6 +348,96 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
         egui::CursorIcon::Grab
     };
     Some(Hit { tip: Some(tip.into()), ..Hit::new(Owner::Model3d { index: m.index }, Layer::Placed, icon) })
+}
+
+/// The tree node of the part drawn at screen point `p` in the model's last frame.
+fn node_at(m: &Model, p: Pos2) -> Option<usize> {
+    let (r, f) = (m.screen?, m.frame.as_ref()?);
+    let Load::Ready(scene) = &m.load else { return None };
+    let x = (p.x - r.left()) / r.width().max(1.0) * f.image.width as f32;
+    let y = (p.y - r.top()) / r.height().max(1.0) * f.image.height as f32;
+    // Inside the picture, so the casts are exact.
+    let mesh = (x >= 0.0 && y >= 0.0).then(|| f.mesh_at(x as u32, y as u32)).flatten()?;
+    scene.mesh_nodes.get(mesh).copied().flatten()
+}
+
+/// The sliding part moved by a drag of `d` (screen points): the world move the drag makes across
+/// the view at the part's depth, of which only the share along the mate counts.
+fn slide_step(m: &mut Model, d: egui::Vec2) {
+    let (Some(r), Some((drawn_with, size, _)), Load::Ready(scene), Some(mut slide)) = (m.screen, m.drawn, &m.load, m.mates.slide) else { return };
+    let centre = scene.centres.get(slide.mover).copied().flatten().unwrap_or(drawn_with.target);
+    let forward = scene::normalize(scene::sub(drawn_with.target, drawn_with.eye)).unwrap_or([0.0, 0.0, -1.0]);
+    let depth = scene::dot(scene::sub(centre, drawn_with.eye), forward);
+    let px = f64::from(size[0]) / f64::from(r.width().max(1.0));
+    let (cx, cy) = (f64::from(size[0]) / 2.0, f64::from(size[1]) / 2.0);
+    let at = |x: f64, y: f64| drawn_with.unproject(x, y, size[0], size[1], depth);
+    if let (Some(a), Some(b)) = (at(cx, cy), at(cx + f64::from(d.x) * px, cy + f64::from(d.y) * px)) {
+        let units = measure::Units::of(scene);
+        slide.slide_by(scene::sub(b, a), units);
+        tree::set_slide(scene, &mut m.parts, &mut m.mates, slide, units);
+    }
+}
+
+/// The slide of the part pressed at `p`, as a right-button drag on it starts: a limit distance
+/// mate that moves the component holding it, picked in the Mates list. Whether there is one.
+fn start_part_slide(m: &mut Model, p: Pos2) -> bool {
+    let (Some(node), Some(all)) = (node_at(m, p), m.mates.mates.clone()) else { return false };
+    let Load::Ready(scene) = &m.load else { return false };
+    let top = mates::top_component(scene, node);
+    let found = all.of_node(scene, top).into_iter().find_map(|k| mates::Slide::of(&all, k, scene, Some(node)).filter(|s| s.mover == top));
+    let Some(mut slide) = found else { return false };
+    if let Some(&at) = m.mates.left_at.get(&slide.mate) {
+        slide.at = at.clamp(slide.lo, slide.hi);
+    }
+    m.mates.picked = Some(slide.mate);
+    m.mates.slide = Some(slide);
+    m.parts.also = all.joined(slide.mate).into_iter().collect();
+    m.parts.changed();
+    true
+}
+
+/// Right-button drags on a model, which the pages' router (it holds primary presses only) never
+/// gives [`page_input`]. As in SOLIDWORKS, one on a part that a limit distance mate lets slide
+/// moves the part along the mate, within its limits; anywhere else on the model it moves the
+/// view. Only with the Select tool, as the model's other drags. Whether it acted.
+pub(crate) fn secondary_input(ui: &egui::Ui, resp: &egui::Response, page: usize, tool: QuickTool, view: &mut View3d, cursor: &mut crate::page_cursor::PageCursor) -> bool {
+    use egui::PointerButton::Secondary;
+    if tool != QuickTool::Select {
+        return false;
+    }
+    if resp.drag_started_by(Secondary) {
+        view.right_drag = None;
+        let origin = ui.input(|i| i.pointer.press_origin());
+        let key = origin.and_then(|o| {
+            let mut keys: Vec<_> =
+                view.models.iter().filter(|(k, m)| k.0 == page && matches!(m.load, Load::Ready(_)) && m.screen.is_some_and(|r| r.contains(o))).map(|(k, _)| *k).collect();
+            keys.sort_unstable();
+            keys.first().copied()
+        });
+        if let (Some(key), Some(o)) = (key, origin)
+            && let Some(m) = view.models.get_mut(&key)
+        {
+            m.mates.sliding = start_part_slide(m, o);
+            view.right_drag = Some(key);
+        }
+    }
+    let Some(key) = view.right_drag.filter(|k| k.0 == page) else { return false };
+    let Some(m) = view.models.get_mut(&key) else { return false };
+    let d = resp.drag_delta();
+    if m.mates.sliding {
+        slide_step(m, d);
+    } else if let Some(camera) = m.camera.as_mut() {
+        let height = f64::from(m.area.or(m.screen).map_or(400.0, |r| r.height()));
+        scene::pan(camera, f64::from(d.x), f64::from(d.y), height);
+    }
+    if !resp.dragged_by(Secondary) || resp.drag_stopped() {
+        m.mates.sliding = false;
+        view.right_drag = None;
+    }
+    m.moving_until = ui.input(|i| i.time) + SETTLE;
+    cursor.claim(Layer::Drag, egui::CursorIcon::Move);
+    ui.ctx().request_repaint();
+    true
 }
 
 /// A press the model holds: drags turn or move it, a click picks a part, a double-click resets
@@ -379,41 +471,17 @@ pub(crate) fn page_input(
     }) {
         m.press_at = Some(at);
     }
-    // A limit mate picked in the Mates list: a drag that starts on the part it lets slide slides
-    // that part along the mate, within its limits.
-    if ptr.drag_started
-        && let Some(slide) = m.mates.slide
-    {
-        let pressed = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
-            let Load::Ready(scene) = &m.load else { return None };
-            let x = (p.x - r.left()) / r.width().max(1.0) * f.image.width as f32;
-            let y = (p.y - r.top()) / r.height().max(1.0) * f.image.height as f32;
-            // Inside the picture, so the casts are exact.
-            let mesh = (x >= 0.0 && y >= 0.0).then(|| f.mesh_at(x as u32, y as u32)).flatten()?;
-            scene.mesh_nodes.get(mesh).copied().flatten()
-        });
-        m.mates.sliding = match (&m.load, pressed) {
-            (Load::Ready(scene), Some(node)) => scene.subtree(slide.mover).contains(&node),
-            _ => false,
-        };
+    // A limit mate picked in the Mates list: a left-button drag that starts on the part it lets
+    // slide slides that part along the mate, within its limits (a right-button drag on a part does
+    // without picking: [`secondary_input`]).
+    if ptr.drag_started {
+        m.mates.sliding = false;
+        if let (Some(slide), Some(node)) = (m.mates.slide, m.press_at.or(ptr.origin).and_then(|p| node_at(m, p))) {
+            m.mates.sliding = matches!(&m.load, Load::Ready(scene) if scene.subtree(slide.mover).contains(&node));
+        }
     }
     if m.mates.sliding {
-        if let (Some(r), Some((drawn_with, size, _)), Load::Ready(scene), Some(mut slide)) = (m.screen, m.drawn, &m.load, m.mates.slide) {
-            let d = resp.drag_delta();
-            // Across the view at the part's depth: the world move the drag makes, of which only
-            // the share along the mate counts.
-            let centre = scene.centres.get(slide.mover).copied().flatten().unwrap_or(drawn_with.target);
-            let forward = scene::normalize(scene::sub(drawn_with.target, drawn_with.eye)).unwrap_or([0.0, 0.0, -1.0]);
-            let depth = scene::dot(scene::sub(centre, drawn_with.eye), forward);
-            let px = f64::from(size[0]) / f64::from(r.width().max(1.0));
-            let (cx, cy) = (f64::from(size[0]) / 2.0, f64::from(size[1]) / 2.0);
-            let at = |x: f64, y: f64| drawn_with.unproject(x, y, size[0], size[1], depth);
-            if let (Some(a), Some(b)) = (at(cx, cy), at(cx + f64::from(d.x) * px, cy + f64::from(d.y) * px)) {
-                let units = measure::Units::of(scene);
-                slide.slide_by(scene::sub(b, a), units);
-                tree::set_slide(scene, &mut m.parts, &mut m.mates, slide, units);
-            }
-        }
+        slide_step(m, resp.drag_delta());
         if !resp.dragged() || resp.drag_stopped() {
             m.mates.sliding = false;
         }

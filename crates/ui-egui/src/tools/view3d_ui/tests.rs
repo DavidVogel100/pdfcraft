@@ -1091,6 +1091,53 @@ fn view3d_mates() {
             h.run_steps(30);
             h.render().unwrap().save(out.join(file)).unwrap();
         }
+        // A right-button drag on the part, with no mate picked, slides it along its mate.
+        {
+            let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+            let mut s = slide;
+            s.at = s.start;
+            super::tree::set_slide(&scene, &mut m.parts, &mut m.mates, s, units);
+            m.mates.picked = None;
+            m.mates.slide = None;
+            m.parts.selected = None;
+            m.parts.also.clear();
+            m.parts.changed();
+        }
+        h.run_steps(30);
+        let at = {
+            let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+            let (f, r) = (m.frame.as_ref().unwrap(), m.screen.unwrap());
+            let under = scene.subtree(slide.mover);
+            let (w, hgt) = (f.image.width, f.image.height);
+            let mut hits = Vec::new();
+            for y in (0..hgt).step_by(2) {
+                for x in (0..w).step_by(2) {
+                    if f.mesh_at(x, y).and_then(|k| scene.mesh_nodes[k]).is_some_and(|n| under.contains(&n)) {
+                        hits.push((x, y));
+                    }
+                }
+            }
+            let (x, y) = hits[hits.len() / 2];
+            egui::pos2(r.left() + x as f32 / w as f32 * r.width(), r.top() + y as f32 / hgt as f32 * r.height())
+        };
+        let before = h.state().views[0].view3d.camera(0, 0);
+        h.event(egui::Event::PointerMoved(at));
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.run_steps(1);
+        for k in 1..=8 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(0.0, -60.0) * (k as f32 / 8.0)));
+            h.run_steps(1);
+        }
+        h.event(egui::Event::PointerButton { pos: at + egui::vec2(0.0, -60.0), button: egui::PointerButton::Secondary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(30);
+        {
+            let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+            let now = m.mates.left_at.get(&slide.mate).copied();
+            eprintln!("right-drag: slide now {now:?} (was {}), view kept {}", slide.start, before == h.state().views[0].view3d.camera(0, 0));
+            assert!(now.is_some_and(|v| (v - slide.start).abs() > 1.0), "the right-drag slid the part");
+            assert_eq!(before, h.state().views[0].view3d.camera(0, 0), "the view stays put");
+        }
+        h.render().unwrap().save(out.join("right-dragged.png")).unwrap();
         // Sliding by hand stops at the limits.
         let mut s = slide;
         s.slide_by(slide.dir.map(|c| c * 1e6), units);

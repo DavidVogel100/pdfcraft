@@ -264,6 +264,7 @@ pub(super) fn page_tool_input(ui: &mut egui::Ui, view: &mut DocView, frame: &mut
     // leaves them unselected. A press nobody holds that another tool took this frame (Prepare's
     // selection rectangle, added content) is not also a commenting tool's, as before.
     let on_model = crate::view3d_ui::page_input(ui, resp, i, press, ptr, &mut view.view3d, &mut view.cursor);
+    let on_model = crate::view3d_ui::secondary_input(ui, resp, i, tool, &mut view.view3d, &mut view.cursor) || on_model;
     // A dimension moved or a layer made on a model: the app applies it.
     if let Some(e) = view.view3d.take_edit() {
         view.pending_edit = Some(e);
