@@ -20,6 +20,7 @@ use crate::page_router::{Hit, Owner, PagePress};
 
 mod dims;
 mod export;
+mod mates;
 mod measure;
 mod scene;
 mod sheet;
@@ -236,6 +237,8 @@ struct Model {
     note_draft: Option<(pdfcraft_engine::NotePlace3d, String)>,
     /// The picked note's text as it is being changed.
     note_text: Option<(usize, String)>,
+    /// The mates attached to the document, as they join this model's parts.
+    mates: mates::MateState,
 }
 
 impl Model {
@@ -707,6 +710,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             note_hits: Vec::new(),
             note_draft: None,
             note_text: None,
+            mates: mates::MateState::default(),
         });
         // The area the model is drawn in: its box, or its whole page.
         let box_rect = r;
@@ -732,6 +736,7 @@ pub(crate) fn paint(ui: &egui::Ui, on: &OnPage<'_>, view: &mut View3d, pointer: 
             }
             Load::Ready(scene) => Arc::clone(scene),
         };
+        m.mates.refresh(doc, &scene);
         let Some(bounds) = scene.bounds else {
             label(&painter, r, paper, &[tl!("This 3D model can't be shown").to_owned(), tl!("the model is empty").to_owned()]);
             continue;
@@ -935,6 +940,13 @@ fn paint_overlays(painter: &egui::Painter, r: Rect, m: &mut Model, scene: &Scene
             }
         }
         m.label_hits = measure::paint(painter, r, drawn_size, &drawn_with, &m.measure, units);
+        // The mate picked in the Mates list.
+        if let (Some(all), Some(k)) = (m.mates.mates.as_ref(), m.mates.picked)
+            && let Some(mate) = all.mates.get(k)
+        {
+            let reach = scene.bounds.map_or(1.0, |b| (0..3).map(|a| b.max[a] - b.min[a]).fold(0.0, f64::max));
+            mates::paint(painter, r, drawn_size, &drawn_with, mate, units, reach);
+        }
     }
 }
 

@@ -957,3 +957,112 @@ fn file_export_saves_the_model_as_stl_and_step() {
     assert!(std::fs::read_to_string(dir.join("model.step")).unwrap().starts_with("ISO-10303-21;"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lists the model tree's names of the PDF in `VIEW3D_PDF`, for matching mates to parts by hand.
+#[test]
+fn view3d_dump_names() {
+    let Some(pdf) = std::env::var_os("VIEW3D_NAMES") else { return };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+    let super::Load::Ready(scene) = &m.load else { panic!() };
+    for (k, n) in scene.nodes.iter().enumerate() {
+        println!("NODE {k} parent {:?} meshes {} name {:?}", n.parent, n.meshes.len(), n.name);
+    }
+}
+
+/// Mates on a real assembly: `VIEW3D_PDF` with the mates file `VIEW3D_MATES` attached (as the
+/// SOLIDWORKS exporter writes it). Checks each mate's sides lie on the parts they name, draws one
+/// picked, and writes the PDF with the mates attached to `VIEW3D_OUT/with-mates.pdf`.
+#[test]
+#[ignore = "needs a real 3D PDF and its mates; run by hand"]
+fn view3d_mates() {
+    let (Some(pdf), Some(json), Some(out)) = (std::env::var_os("VIEW3D_PDF"), std::env::var_os("VIEW3D_MATES"), std::env::var_os("VIEW3D_OUT")) else {
+        return;
+    };
+    let bytes = std::fs::read(&pdf).unwrap();
+    let mates = std::fs::read(&json).unwrap();
+    let out = std::path::PathBuf::from(out);
+    let name = std::path::Path::new(&pdf).file_stem().unwrap().to_string_lossy().into_owned();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("model.pdf", None, bytes.clone()).unwrap();
+        app.choose_right_panel(Some(crate::state::RightPanel::Model3d));
+        app
+    });
+    for _ in 0..6000 {
+        h.run_steps(2);
+        if h.state().views[0].view3d.camera(0, 0).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let edit = pdfcraft_engine::Edit::AddAttachment {
+        name: format!("{name}.mates.json"),
+        bytes: mates,
+        description: Some("Mates exported from the CAD assembly".into()),
+        mime: Some("application/json".into()),
+    };
+    assert!(h.state_mut().apply_edit(edit));
+    h.run_steps(6);
+    let (count, node) = {
+        let m = h.state().views[0].view3d.models.get(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!() };
+        assert!(m.mates.error.is_none(), "{:?}", m.mates.error);
+        let all = m.mates.mates.as_ref().expect("the mates were read");
+        eprintln!("{} mates, missing {:?}", all.mates.len(), all.missing);
+        // Each side's point lies on (or in) the part it names: near one of its corners.
+        let units = super::measure::Units::of(scene);
+        let mut worst = 0.0f64;
+        for (k, mate) in all.mates.iter().enumerate() {
+            for (e, side) in mate.entities.iter().enumerate() {
+                let (Some(n), Some(p)) = (all.nodes[k].get(e).copied().flatten(), side.point) else { continue };
+                let p = p.map(|c| c / units.mm_per_unit);
+                let near = scene
+                    .subtree(n)
+                    .iter()
+                    .flat_map(|&x| scene.nodes[x].meshes.clone())
+                    .flat_map(|mk| scene.meshes[mk].mesh.positions.clone())
+                    .map(|q| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2)).sqrt())
+                    .fold(f64::INFINITY, f64::min);
+                if near > worst {
+                    eprintln!("{} side {e} ({}): {near:.3} units from its part", mate.name, side.kind);
+                }
+                worst = worst.max(near);
+            }
+        }
+        eprintln!("worst {worst:.3} model units (mm per unit {})", units.mm_per_unit);
+        let screw = scene.nodes.iter().position(|n| n.name.ends_with("Screw-1")).unwrap_or(0);
+        (all.mates.len(), screw)
+    };
+    assert!(count > 0);
+    {
+        let v = &mut h.state_mut().views[0];
+        let m = v.view3d.models.get_mut(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        m.parts.select(&scene, Some(node));
+        m.mates.open = true;
+        let all = m.mates.mates.clone().unwrap();
+        let k = all.of_node(&scene, node).into_iter().find(|&k| all.mates[k].kind.contains("Concentric")).unwrap_or(0);
+        m.mates.picked = Some(k);
+        m.parts.also = all.joined(k).into_iter().collect();
+        m.parts.changed();
+    }
+    h.run_steps(30);
+    h.render().unwrap().save(out.join("mates-picked.png")).unwrap();
+    let id = h.state().views[0].id;
+    let saved = h.state().session.save_bytes(id).unwrap();
+    std::fs::write(out.join("with-mates.pdf"), saved.as_slice()).unwrap();
+}

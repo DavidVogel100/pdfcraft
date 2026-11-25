@@ -113,6 +113,24 @@ pub fn set_attachment_description(doc: &mut Document, key: &str, description: Op
     Ok(())
 }
 
+/// The first document-level attachment whose key `wanted` accepts: its key and its bytes,
+/// decoded, when they are at most `max` bytes.
+pub fn attachment_named(doc: &Document, wanted: impl Fn(&str) -> bool, max: usize) -> Option<(String, Vec<u8>)> {
+    entries(doc).into_iter().find_map(|(name, spec)| {
+        let key = PdfString::literal(name).to_text();
+        if !wanted(&key) {
+            return None;
+        }
+        let spec = doc.resolve(&spec);
+        let ef = doc.resolve(spec.as_dict()?.get(b"EF")?);
+        let ef = ef.as_dict()?;
+        let file = doc.resolve(ef.get(b"UF").or_else(|| ef.get(b"F"))?);
+        let Object::Stream(s) = file.as_ref() else { return None };
+        let data = doc.with_direct_parms(s).decoded_within(max).ok()?;
+        Some((key, Vec::from(data)))
+    })
+}
+
 /// The `/EmbeddedFiles` entries (key, file specification), in tree order.
 fn entries(doc: &Document) -> Vec<(Vec<u8>, Object)> {
     let Some(tree) = doc

@@ -33,6 +33,8 @@ pub(crate) struct Parts {
     pub(crate) rev: u64,
     /// Parts moved by hand while taken apart: how far, in the world.
     pub(crate) moved: std::collections::HashMap<usize, [f64; 3]>,
+    /// Parts highlighted with the selection: those a mate picked in the Mates list joins.
+    pub(crate) also: HashSet<usize>,
 }
 
 impl Parts {
@@ -227,7 +229,7 @@ pub(crate) fn look_of(scene: &Scene, parts: &Parts, section: Option<Section>, ex
         let parent = node.parent.filter(|&p| p < i);
         hidden[i] = parts.hidden.contains(&i) || parent.is_some_and(|p| hidden[p]);
         inside[i] = parts.isolated.is_none() || parts.isolated == Some(i) || parent.is_some_and(|p| inside[p]);
-        picked[i] = parts.selected == Some(i) || parent.is_some_and(|p| picked[p]);
+        picked[i] = parts.selected == Some(i) || parts.also.contains(&i) || parent.is_some_and(|p| picked[p]);
     }
     let of = |v: &[bool], node: Option<usize>, none: bool| node.and_then(|k| v.get(k).copied()).unwrap_or(none);
     Look {
@@ -398,6 +400,8 @@ pub(crate) fn tree_panel(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &m
             parts.expanded.insert(root);
             row(ui, t, &scene, parts, &mut layers, root, 0, false);
         }
+        mates_list(ui, t, &scene, &mut m.parts, &mut m.mates);
+        let parts = &mut m.parts;
         // A layer opened: its part isolated and turned to the layer's view.
         if let Some((node, k)) = layers.open {
             parts.selected = Some(node);
@@ -595,6 +599,92 @@ fn row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, layers: 
         for &k in kids {
             row(ui, t, scene, parts, layers, k, depth + 1, hidden_here);
         }
+    }
+}
+
+/// The Mates folder under the tree, as SOLIDWORKS lists it: with a part selected, the mates that
+/// hold it; else all of them. A click on a mate highlights the parts it joins and draws its axes
+/// and planes on the model; another click lets it go.
+fn mates_list(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, state: &mut super::mates::MateState) {
+    use super::mates;
+    if let Some(e) = &state.error {
+        ui.add_space(6.0);
+        let text = crate::i18n::fmt(tl!("The mates attachment can't be read: {e}"), &[("e", e)]);
+        ui.label(egui::RichText::new(text).color(t.text_muted));
+        return;
+    }
+    let Some(all) = state.mates.clone() else { return };
+    let units = super::measure::Units::of(scene);
+    let (list, title) = match parts.selected.and_then(|n| scene.nodes.get(n).map(|x| (n, x))) {
+        Some((n, node)) => (all.of_node(scene, n), crate::i18n::fmt(tl!("Mates of {name}"), &[("name", &display_name(&node.name))])),
+        None => ((0..all.mates.len()).collect::<Vec<_>>(), tl!("Mates").to_owned()),
+    };
+    // A mate picked that the list no longer shows lets go of its parts.
+    if state.picked.is_some_and(|k| !list.contains(&k)) {
+        state.picked = None;
+        parts.also.clear();
+        parts.changed();
+    }
+    ui.add_space(6.0);
+    ui.separator();
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    let header = format!("{title} ({})", list.len());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TreeItem, true, &header));
+    let press = theme::Press::track(ui, &resp);
+    press.wash(ui, rect, 4, false);
+    icons::paint(ui, Rect::from_min_size(pos2(rect.left() + 2.0, rect.top() + 3.0), vec2(16.0, 16.0)), if state.open { "chevron-down" } else { "chevron-right" }, 13.0, t.text_muted);
+    icons::paint(ui, Rect::from_min_size(pos2(rect.left() + 20.0, rect.top() + 3.0), vec2(16.0, 16.0)), "link", 13.0, t.accent_text);
+    ui.painter_at(rect).text(pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, &header, theme::medium(13.0), t.text);
+    let resp = resp.on_hover_text(crate::i18n::fmt(tl!("From {file}, written by {source}"), &[("file", &all.file), ("source", &all.source)]));
+    if resp.clicked() {
+        state.open = !state.open;
+    }
+    if !state.open {
+        return;
+    }
+    if list.is_empty() {
+        ui.label(egui::RichText::new(tl!("No mates hold this part.")).color(t.text_muted));
+    }
+    for k in list {
+        let Some(mate) = all.mates.get(k) else { continue };
+        let joined: Vec<String> = mate.entities.iter().filter_map(|e| e.component.as_deref()).map(|c| display_name(c.rsplit('/').next().unwrap_or(c))).collect();
+        let value = mates::value_text(mate, units);
+        let mut text = format!("{} ({})", mate.name, joined.join(", "));
+        if !value.is_empty() {
+            text.push_str(&format!("  {value}"));
+        }
+        let picked = state.picked == Some(k);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::TreeItem, true, picked, &text));
+        let press = theme::Press::track(ui, &resp);
+        press.wash(ui, rect, 4, picked);
+        let colour = if mate.suppressed { t.text_faint } else { t.text };
+        icons::paint(ui, Rect::from_min_size(pos2(rect.left() + 20.0, rect.top() + 3.0), vec2(16.0, 16.0)), mates::icon(mate), 13.0, if mate.suppressed { t.text_faint } else { t.accent_text });
+        ui.painter_at(rect).text(pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, &text, theme::regular(13.0), colour);
+        let mut tip = format!("{}: {}", mates::type_name(mate), joined.join(" ↔ "));
+        if !value.is_empty() {
+            tip.push_str(&format!("\n{value}"));
+        }
+        if let Some(a) = mate.alignment.as_deref() {
+            tip.push_str(&format!("\n{}", crate::i18n::fmt(tl!("Alignment: {a}"), &[("a", a)])));
+        }
+        if mate.suppressed {
+            tip.push_str(&format!("\n{}", tl!("Suppressed")));
+        }
+        if resp.on_hover_text(tip).clicked() {
+            if picked {
+                state.picked = None;
+                parts.also.clear();
+            } else {
+                state.picked = Some(k);
+                parts.also = all.joined(k).into_iter().collect();
+            }
+            parts.changed();
+        }
+    }
+    if !all.missing.is_empty() {
+        let text = crate::i18n::fmt(tl!("{n} parts the mates name are not in this model"), &[("n", &all.missing.len().to_string())]);
+        ui.label(egui::RichText::new(text).color(t.text_muted)).on_hover_text(all.missing.join("\n"));
     }
 }
 
