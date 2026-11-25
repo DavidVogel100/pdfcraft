@@ -320,7 +320,10 @@ pub(crate) fn hit(xf: &PageXform, info: &DocInfo, page: usize, tool: QuickTool, 
         if whole { xf.rect } else { xf.user_rect(info, page, m.rect) }
     };
     let m = info.annots_3d.iter().rev().find(|m| m.page == page && area(m).contains(p) && view.ready(page, m.index))?;
-    let tip = if view.explode.move_parts {
+    let sliding = view.models.get(&(page, m.index)).is_some_and(|shown| shown.mates.slide.is_some());
+    let tip = if sliding {
+        tl!("Drag the part the picked mate holds to slide it · Drag elsewhere to turn · Wheel to zoom")
+    } else if view.explode.move_parts {
         tl!("Drag a part to move it · Shift+drag to move the view · Wheel to zoom")
     } else if view.noting {
         tl!("Click the part for a note pointing at it, or beside it for a note on the sheet")
@@ -375,6 +378,49 @@ pub(crate) fn page_input(
         crate::page_pointer::Edge::Release(_) => None,
     }) {
         m.press_at = Some(at);
+    }
+    // A limit mate picked in the Mates list: a drag that starts on the part it lets slide slides
+    // that part along the mate, within its limits.
+    if ptr.drag_started
+        && let Some(slide) = m.mates.slide
+    {
+        let pressed = m.press_at.or(ptr.origin).zip(m.screen).zip(m.frame.as_ref()).and_then(|((p, r), f)| {
+            let Load::Ready(scene) = &m.load else { return None };
+            let x = (p.x - r.left()) / r.width().max(1.0) * f.image.width as f32;
+            let y = (p.y - r.top()) / r.height().max(1.0) * f.image.height as f32;
+            // Inside the picture, so the casts are exact.
+            let mesh = (x >= 0.0 && y >= 0.0).then(|| f.mesh_at(x as u32, y as u32)).flatten()?;
+            scene.mesh_nodes.get(mesh).copied().flatten()
+        });
+        m.mates.sliding = match (&m.load, pressed) {
+            (Load::Ready(scene), Some(node)) => scene.subtree(slide.mover).contains(&node),
+            _ => false,
+        };
+    }
+    if m.mates.sliding {
+        if let (Some(r), Some((drawn_with, size, _)), Load::Ready(scene), Some(mut slide)) = (m.screen, m.drawn, &m.load, m.mates.slide) {
+            let d = resp.drag_delta();
+            // Across the view at the part's depth: the world move the drag makes, of which only
+            // the share along the mate counts.
+            let centre = scene.centres.get(slide.mover).copied().flatten().unwrap_or(drawn_with.target);
+            let forward = scene::normalize(scene::sub(drawn_with.target, drawn_with.eye)).unwrap_or([0.0, 0.0, -1.0]);
+            let depth = scene::dot(scene::sub(centre, drawn_with.eye), forward);
+            let px = f64::from(size[0]) / f64::from(r.width().max(1.0));
+            let (cx, cy) = (f64::from(size[0]) / 2.0, f64::from(size[1]) / 2.0);
+            let at = |x: f64, y: f64| drawn_with.unproject(x, y, size[0], size[1], depth);
+            if let (Some(a), Some(b)) = (at(cx, cy), at(cx + f64::from(d.x) * px, cy + f64::from(d.y) * px)) {
+                let units = measure::Units::of(scene);
+                slide.slide_by(scene::sub(b, a), units);
+                tree::set_slide(scene, &mut m.parts, &mut m.mates, slide, units);
+            }
+        }
+        if !resp.dragged() || resp.drag_stopped() {
+            m.mates.sliding = false;
+        }
+        m.moving_until = now + SETTLE;
+        cursor.claim(Layer::Drag, egui::CursorIcon::Move);
+        ui.ctx().request_repaint();
+        return true;
     }
     // Taken apart, with moving parts on: a drag on a part moves it across the view.
     if apart && view.explode.move_parts && ptr.drag_started {

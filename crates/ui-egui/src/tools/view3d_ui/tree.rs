@@ -35,6 +35,8 @@ pub(crate) struct Parts {
     pub(crate) moved: std::collections::HashMap<usize, [f64; 3]>,
     /// Parts highlighted with the selection: those a mate picked in the Mates list joins.
     pub(crate) also: HashSet<usize>,
+    /// Parts slid along their mates: how far, in the world. They stay there with explode off.
+    pub(crate) mated: std::collections::HashMap<usize, [f64; 3]>,
 }
 
 impl Parts {
@@ -99,12 +101,30 @@ impl ExplodeState {
 /// How far each part is from its place: out from the middle of what is shown, by `amount`
 /// (at 1, twice as far again as it is from the middle), plus any move by hand.
 pub(crate) fn part_offsets(scene: &Scene, parts: &Parts, explode: &ExplodeState) -> Option<Vec<[f64; 3]>> {
-    if !explode.on {
+    let slid = parts.mated.values().any(|v| v.iter().any(|c| *c != 0.0));
+    if !explode.on && !slid {
         return None;
     }
     // The middle of what is shown: the part isolated, else the whole model.
-    let root_centre = parts.isolated.and_then(|i| scene.centres.get(i).copied().flatten()).or_else(|| scene.bounds.map(|b| b.centre()))?;
-    let k = 2.0 * f64::from(explode.amount.clamp(0.0, 1.0));
+    let root_centre = parts.isolated.and_then(|i| scene.centres.get(i).copied().flatten()).or_else(|| scene.bounds.map(|b| b.centre())).unwrap_or([0.0; 3]);
+    let k = if explode.on { 2.0 * f64::from(explode.amount.clamp(0.0, 1.0)) } else { 0.0 };
+    // A slide moves a component and everything under it.
+    let along_mates = |node: usize| {
+        let mut total = [0.0; 3];
+        let mut at = Some(node);
+        let mut steps = 0;
+        while let Some(n) = at {
+            if let Some(v) = parts.mated.get(&n) {
+                total = [0, 1, 2].map(|a| total[a] + v[a]);
+            }
+            at = scene.nodes.get(n).and_then(|x| x.parent).filter(|&p| p < n);
+            steps += 1;
+            if steps > MAX_DEPTH * 4 {
+                break;
+            }
+        }
+        total
+    };
     Some(
         scene
             .mesh_nodes
@@ -112,8 +132,9 @@ pub(crate) fn part_offsets(scene: &Scene, parts: &Parts, explode: &ExplodeState)
             .map(|&node| {
                 let Some(node) = node else { return [0.0; 3] };
                 let centre = scene.centres.get(node).copied().flatten().unwrap_or(root_centre);
-                let by_hand = parts.moved.get(&node).copied().unwrap_or([0.0; 3]);
-                [0, 1, 2].map(|a| (centre[a] - root_centre[a]) * k + by_hand[a])
+                let by_hand = if explode.on { parts.moved.get(&node).copied().unwrap_or([0.0; 3]) } else { [0.0; 3] };
+                let slid = along_mates(node);
+                [0, 1, 2].map(|a| (centre[a] - root_centre[a]) * k + by_hand[a] + slid[a])
             })
             .collect(),
     )
@@ -622,6 +643,7 @@ fn mates_list(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, s
     // A mate picked that the list no longer shows lets go of its parts.
     if state.picked.is_some_and(|k| !list.contains(&k)) {
         state.picked = None;
+        state.slide = None;
         parts.also.clear();
         parts.changed();
     }
@@ -671,21 +693,74 @@ fn mates_list(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, s
         if mate.suppressed {
             tip.push_str(&format!("\n{}", tl!("Suppressed")));
         }
+        if mates::Slide::of(&all, k, scene, parts.selected).is_some() {
+            tip.push_str(&format!("\n{}", tl!("Pick it, then drag the part on the model to slide it within its limits")));
+        }
         if resp.on_hover_text(tip).clicked() {
             if picked {
                 state.picked = None;
+                state.slide = None;
                 parts.also.clear();
             } else {
                 state.picked = Some(k);
                 parts.also = all.joined(k).into_iter().collect();
+                state.slide = mates::Slide::of(&all, k, scene, parts.selected).map(|mut s| {
+                    if let Some(&at) = state.left_at.get(&k) {
+                        s.at = at.clamp(s.lo, s.hi);
+                    }
+                    s
+                });
             }
             parts.changed();
+        }
+        if picked {
+            slide_row(ui, t, scene, parts, state, units);
         }
     }
     if !all.missing.is_empty() {
         let text = crate::i18n::fmt(tl!("{n} parts the mates name are not in this model"), &[("n", &all.missing.len().to_string())]);
         ui.label(egui::RichText::new(text).color(t.text_muted)).on_hover_text(all.missing.join("\n"));
     }
+}
+
+/// Under a picked limit mate: how far apart its faces are now, a slider between its limits, and
+/// a way back to where the model has it.
+fn slide_row(ui: &mut egui::Ui, t: &Tokens, scene: &Scene, parts: &mut Parts, state: &mut super::mates::MateState, units: super::measure::Units) {
+    let Some(mut slide) = state.slide else { return };
+    let mover = scene.nodes.get(slide.mover).map(|n| display_name(&n.name)).unwrap_or_default();
+    let length = |mm: f64| units.length(mm / units.mm_per_unit.max(1e-12));
+    ui.horizontal(|ui| {
+        ui.add_space(42.0);
+        ui.label(egui::RichText::new(crate::i18n::fmt(tl!("Slide {part}"), &[("part", &mover)])).color(t.text_muted).font(theme::regular(12.0)));
+    });
+    let before = slide.at;
+    ui.horizontal(|ui| {
+        ui.add_space(42.0);
+        let lo = slide.lo;
+        let hi = slide.hi;
+        ui.add(egui::Slider::new(&mut slide.at, lo..=hi).show_value(false))
+            .on_hover_text(tl!("Drag to slide the part between the mate's limits; dragging the part on the model works too"));
+        if ui.button(tl!("As modelled")).on_hover_text(tl!("Back to where the assembly has it")).clicked() {
+            slide.at = slide.start;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(42.0);
+        let text = crate::i18n::fmt(tl!("{now}   (limits {lo} to {hi})"), &[("now", &length(slide.at)), ("lo", &length(slide.lo)), ("hi", &length(slide.hi))]);
+        ui.label(egui::RichText::new(text).color(t.accent_text).font(theme::regular(12.0)));
+    });
+    if slide.at != before {
+        set_slide(scene, parts, state, slide, units);
+    }
+}
+
+/// Puts the part where `slide` has it and remembers it for the mate.
+pub(crate) fn set_slide(scene: &Scene, parts: &mut Parts, state: &mut super::mates::MateState, slide: super::mates::Slide, units: super::measure::Units) {
+    let _ = scene;
+    parts.mated.insert(slide.mover, slide.offset(units));
+    state.left_at.insert(slide.mate, slide.at);
+    state.slide = Some(slide);
+    parts.changed();
 }
 
 /// A layer's row under its part: a click opens it, the eye shows or hides it.

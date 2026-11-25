@@ -1062,6 +1062,42 @@ fn view3d_mates() {
     }
     h.run_steps(30);
     h.render().unwrap().save(out.join("mates-picked.png")).unwrap();
+    // A limit distance mate, when the assembly has one: its moving part slid to each limit.
+    let limit = {
+        let v = &mut h.state_mut().views[0];
+        let m = v.view3d.models.get_mut(&(0, 0)).unwrap();
+        let super::Load::Ready(scene) = &m.load else { panic!() };
+        let scene = std::sync::Arc::clone(scene);
+        let all = m.mates.mates.clone().unwrap();
+        all.mates.iter().position(|x| x.kind.contains("LimitDistance")).map(|k| {
+            let side = all.nodes[k].iter().flatten().copied().last().unwrap();
+            m.parts.select(&scene, Some(side));
+            m.mates.picked = Some(k);
+            let slide = super::mates::Slide::of(&all, k, &scene, Some(side)).expect("a limit mate slides");
+            eprintln!("slide {slide:?} mover {:?}", scene.nodes[slide.mover].name);
+            m.mates.slide = Some(slide);
+            (scene, slide)
+        })
+    };
+    if let Some((scene, slide)) = limit {
+        let units = super::measure::Units::of(&scene);
+        for (at, file) in [(slide.hi, "slid-out.png"), (slide.lo, "slid-in.png")] {
+            {
+                let m = h.state_mut().views[0].view3d.models.get_mut(&(0, 0)).unwrap();
+                let mut s = slide;
+                s.at = at;
+                super::tree::set_slide(&scene, &mut m.parts, &mut m.mates, s, units);
+            }
+            h.run_steps(30);
+            h.render().unwrap().save(out.join(file)).unwrap();
+        }
+        // Sliding by hand stops at the limits.
+        let mut s = slide;
+        s.slide_by(slide.dir.map(|c| c * 1e6), units);
+        assert!((s.at - slide.hi).abs() < 1e-9);
+        s.slide_by(slide.dir.map(|c| c * -1e6), units);
+        assert!((s.at - slide.lo).abs() < 1e-9);
+    }
     let id = h.state().views[0].id;
     let saved = h.state().session.save_bytes(id).unwrap();
     std::fs::write(out.join("with-mates.pdf"), saved.as_slice()).unwrap();

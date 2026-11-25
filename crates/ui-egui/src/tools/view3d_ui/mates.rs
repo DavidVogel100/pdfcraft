@@ -301,6 +301,70 @@ fn unit(a: [f64; 3]) -> [f64; 3] {
     a.map(|c| c / l)
 }
 
+/// A part sliding along a limit distance mate: which mate, the component that moves (the whole
+/// top-level component, a sub-assembly moving as one), the way it moves for the distance to grow
+/// (world, unit length), and the distance now, as modelled and its limits (mm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Slide {
+    pub(crate) mate: usize,
+    pub(crate) mover: usize,
+    pub(crate) dir: [f64; 3],
+    pub(crate) at: f64,
+    pub(crate) start: f64,
+    pub(crate) lo: f64,
+    pub(crate) hi: f64,
+}
+
+impl Slide {
+    /// How mate `k` lets a part slide, when it is a limit distance mate between two faces: the
+    /// side holding `selected` moves (else the second side), the other stays.
+    pub(crate) fn of(all: &Mates, k: usize, scene: &Scene, selected: Option<usize>) -> Option<Slide> {
+        let m = all.mates.get(k)?;
+        if !m.kind.contains("LimitDistance") || m.suppressed {
+            return None;
+        }
+        let (value, lo, hi) = (m.value?, m.min?, m.max?);
+        let nodes = all.nodes.get(k)?;
+        let sides: Vec<(usize, &Entity)> = (0..m.entities.len()).filter_map(|e| Some((nodes.get(e).copied().flatten()?, m.entities.get(e)?))).collect();
+        let [a, b] = sides.as_slice() else { return None };
+        // The side the selected part belongs to moves.
+        let holds = |n: usize| selected.is_some_and(|s| scene.subtree(top_component(scene, n)).contains(&s) || scene.subtree(s).contains(&n));
+        let (moving, staying) = if holds(a.0) && !holds(b.0) { (a, b) } else { (b, a) };
+        let n = super::scene::normalize(staying.1.direction?)?;
+        let (p, q) = (moving.1.point?, staying.1.point?);
+        // The distance grows as the moving side goes away from the staying face along its normal.
+        let sign = if super::scene::dot(super::scene::sub(p, q), n) < 0.0 { -1.0 } else { 1.0 };
+        // SOLIDWORKS gives a limit as how far each end lies from the distance as modelled.
+        let (lo, hi) = (value + lo.min(hi), value + hi.max(lo));
+        Some(Slide { mate: k, mover: top_component(scene, moving.0), dir: n.map(|c| c * sign), at: value, start: value, lo, hi })
+    }
+
+    /// Where the moving part is drawn, from where the model places it (world units).
+    pub(crate) fn offset(&self, units: Units) -> [f64; 3] {
+        let k = (self.at - self.start) / units.mm_per_unit.max(1e-12);
+        self.dir.map(|c| c * k)
+    }
+
+    /// Slid by world vector `step` (only its share along the mate counts), within the limits.
+    pub(crate) fn slide_by(&mut self, step: [f64; 3], units: Units) {
+        let mm = super::scene::dot(step, self.dir) * units.mm_per_unit;
+        self.at = (self.at + mm).clamp(self.lo, self.hi);
+    }
+}
+
+/// The highest component above `node` (itself when it is one at the top): what moves as one.
+pub(crate) fn top_component(scene: &Scene, node: usize) -> usize {
+    let mut top = node;
+    let mut up = scene.nodes.get(node).and_then(|n| n.parent);
+    while let Some(p) = up {
+        if scene.nodes.get(p).is_some_and(|n| is_component(&n.name)) {
+            top = p;
+        }
+        up = scene.nodes.get(p).and_then(|n| n.parent);
+    }
+    top
+}
+
 /// The mates of a model as kept with it: read again after every edit (attaching the file is one).
 #[derive(Default)]
 pub(crate) struct MateState {
@@ -311,6 +375,11 @@ pub(crate) struct MateState {
     pub(crate) picked: Option<usize>,
     /// The Mates folder (all of them) is open.
     pub(crate) open: bool,
+    /// The picked mate lets a part slide: how, and whether a drag on the model is sliding it.
+    pub(crate) slide: Option<Slide>,
+    pub(crate) sliding: bool,
+    /// Where each mate's slide was left, so picking it again carries on from there.
+    pub(crate) left_at: std::collections::HashMap<usize, f64>,
 }
 
 impl MateState {
@@ -334,6 +403,7 @@ impl MateState {
         };
         let count = self.mates.as_ref().map_or(0, |m| m.mates.len());
         self.picked = self.picked.filter(|&k| k < count);
+        self.slide = self.slide.filter(|s| s.mate < count);
     }
 }
 
